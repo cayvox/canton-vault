@@ -1,0 +1,79 @@
+-- | A Permissionless execution while the
+-- operator's participant is down. The operator is allocated on a second
+-- participant; the underlying registry and the requester stay on the
+-- default one. A first deposit executes with both participants up. The
+-- script then prepares a second execution, with the operator's contracts
+-- disclosed, prints a marker, on which the driving script stops the
+-- operator's participant, waits, submits the execution, and finally
+-- cancels the request. Run through `dpm script` with a participant
+-- configuration. Not a test: it takes an input.
+module Cayvox.VaultV1Test.R20
+  ( R20Input (..)
+  , probeR20
+  ) where
+
+import DA.Time (convertRelTimeToMicroseconds, seconds, subTime)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2 (InstrumentId (..))
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+
+import Cayvox.VaultV1
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+data R20Input = R20Input with
+    tag : Text
+    operatorParticipant : Text
+      -- ^ The participant that hosts the operator, as named in the
+      -- participant configuration.
+    waitSeconds : Int
+      -- ^ How long to wait after the marker before the second execution.
+  deriving (Eq, Show)
+
+outcome : Either SubmitError a -> Text
+outcome (Right _) = "committed"
+outcome (Left e) = "refused: " <> show e
+
+probeR20 : R20Input -> Script [Text]
+probeR20 input = do
+  let tag = input.tag
+  underlying <- setupUnderlying ("underlying-" <> tag)
+  operator <- allocatePartyOn ("operator-" <> tag) (ParticipantName input.operatorParticipant)
+  let instrument = InstrumentId with admin = operator; id = "vault-" <> tag
+  rules <- submit operator $ createCmd ShareRules with admin = operator; instrumentId = instrument; meta = emptyMetadata
+  let shares = S.Registry with operator; rules; instrument
+  requester <- allocateParty ("requester-" <> tag)
+  mintUnderlying underlying requester 1000.0
+  _ <- submit operator $ createCmd (initialState underlying shares Permissionless 0)
+  let w = World with
+        underlying; shares; operator; vaultId = instrument.id; requesters = [requester]; sponsor = requester
+        mode = Permissionless; k = 0
+
+  -- Both participants up.
+  first <- newDeposit w requester 10.0 0.0 False
+  firstItem <- depositItem w requester first
+  firstRes <- executeDeposits w requester [(requester, firstItem)] >>= attempt
+  (_, afterFirst) <- vaultOf w
+
+  -- The second execution, prepared while the operator's participant is up.
+  second <- newDeposit w requester 20.0 0.0 False
+  secondItem <- depositItem w requester second
+  secondSub <- executeDeposits w requester [(requester, secondItem)]
+  debug ("r20: ready to stop the operator's participant " <> input.operatorParticipant)
+  sleep (seconds input.waitSeconds)
+
+  -- The operator's participant is down.
+  before <- getTime
+  secondRes <- attempt secondSub
+  after <- getTime
+  cancelRes <- cancelDeposit w requester (fst second) [] >>= attempt
+  pure
+    [ "r20 " <> tag <> ": operator on participant " <> input.operatorParticipant <> ", requester on the default participant"
+    , "r20 " <> tag <> ": first execution, both participants up: " <> outcome firstRes
+        <> "; A = " <> show afterFirst.totalAssets <> ", S = " <> show afterFirst.totalShares
+    , "r20 " <> tag <> ": second execution, operator's participant stopped: " <> outcome secondRes
+        <> " after " <> show (convertRelTimeToMicroseconds (subTime after before)) <> " us"
+    , "r20 " <> tag <> ": cancellation by the requester, operator's participant stopped: " <> outcome cancelRes
+    ]

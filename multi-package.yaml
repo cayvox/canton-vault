@@ -1,0 +1,16 @@
+# Workspace-only coordinator. Every listed directory owns one Daml package and
+# produces one DAR; category directories are navigation only. The second SDK
+# is selected with DPM_SDK_VERSION (ARCHITECTURE.md, section 4).
+sdk-version: 3.4.11
+
+packages:
+  - packages/utils/vault-math-v1
+  - packages/token/api-vault-v1
+  - packages/token/vault-v1
+  - test/vault-math-v1-test
+  - test/api-vault-v1-test
+  - test/vault-v1-test
+  - examples/vault-admission-v1
+  - examples/vault-admission-v1-test
+  - tools/vault-reconcile
+  - tools/vault-reconcile-test

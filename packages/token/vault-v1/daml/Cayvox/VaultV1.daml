@@ -1,0 +1,682 @@
+-- | Cayvox vault: the vault state and the deposit and redemption requests
+-- (`docs/SPEC.md` §4 and §5). The conversion and preview functions are in
+-- `Cayvox.VaultV1.Conversion`; the share registry, in internal modules, is
+-- used through the Canton Token Standard V2 interfaces, and its rules
+-- contract, `ShareRules`, which the operator creates, is exported here.
+--
+-- Every amount is computed by the conversion functions (D-09). Every
+-- failure has an identifier `cayvox.com/vault-...` and category
+-- `InvalidGivenCurrentSystemStateOther` (D-13; `docs/SPEC.md` §7).
+module Cayvox.VaultV1
+  ( -- * Vault state
+    VaultState (..)
+  , Vault_ExecuteDeposits (..)
+  , Vault_ExecuteRedeems (..)
+  , Vault_AddAssets (..)
+  , Vault_Pause (..)
+  , Vault_Unpause (..)
+  , RegistryRef (..)
+  , DepositItem (..)
+  , RedeemItem (..)
+  , ExecResult (..)
+  , Mode (..)
+    -- * Requests
+  , DepositRequest (..)
+  , DepositRequest_Allocate (..)
+  , DepositRequest_Cancel (..)
+  , RedeemRequest (..)
+  , RedeemRequest_Allocate (..)
+  , RedeemRequest_Cancel (..)
+  , RequestAllocations (..)
+    -- * Share registry
+  , ShareRules (..)
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.Optional (isNone, isSome)
+import qualified DA.Text as T
+import DA.Time (isLedgerTimeLT)
+
+import Splice.Api.Token.AllocationInstructionV2 (AllocationFactory)
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2 (Account (..), Holding, InstrumentId (..))
+import Splice.Api.Token.MetadataV1
+
+import Cayvox.Api.VaultV1 (Mode (..), Vault, VaultView (..))
+import Cayvox.VaultV1.Conversion (previewDeposit, previewRedeem)
+import Cayvox.VaultV1.Internal.Conversion (assetCap, unit, virtualShares)
+import Cayvox.VaultV1.Internal.Failure
+import Cayvox.VaultV1.Internal.ShareRegistry (ShareRules (..), boundedMeta, boundedText, maxTextLength)
+import Cayvox.VaultV1.Internal.TokenStandard (burnAccount, mintAccount, receiverSide, senderSide)
+import Cayvox.VaultV1.Internal.Vault
+
+-- Types
+--------
+
+-- | A registry's factory contracts. The vault uses only the factories
+-- recorded in its state, never ones an executor supplies (T-06).
+data RegistryRef = RegistryRef with
+    allocationFactory : ContractId AllocationFactory
+      -- ^ Where the vault and the requests allocate.
+    settlementFactory : ContractId SettlementFactory
+      -- ^ Where the vault settles.
+  deriving (Eq, Show)
+
+-- | One request of a deposit batch.
+data DepositItem = DepositItem with
+    request : ContractId DepositRequest
+      -- ^ The request to execute.
+    fundingAllocation : Optional (ContractId Allocation)
+      -- ^ The requester's input allocation, when the request is funded.
+    fundingInputs : [ContractId Holding]
+      -- ^ The requester's holdings that fund the input, when it is not.
+  deriving (Eq, Show)
+
+-- | One request of a redemption batch.
+data RedeemItem = RedeemItem with
+    request : ContractId RedeemRequest
+      -- ^ The request to execute.
+    fundingAllocation : Optional (ContractId Allocation)
+      -- ^ The requester's share allocation, when the request is funded.
+    fundingInputs : [ContractId Holding]
+      -- ^ The requester's share holdings, when it is not.
+    vaultInputs : [ContractId Holding]
+      -- ^ The vault account's holdings that pay the redemption, spent before
+      -- the change of the batch's previous redemption (`docs/SPEC.md` §5.4).
+  deriving (Eq, Show)
+
+-- | The result of an execution.
+data ExecResult = ExecResult with
+    successor : ContractId VaultState
+      -- ^ The new vault state.
+    outputs : [Decimal]
+      -- ^ Per request, in batch order: the shares minted, or the assets paid.
+  deriving (Eq, Show)
+
+-- | The allocations a request's delegation choice created.
+data RequestAllocations = RequestAllocations with
+    receipt : ContractId Allocation
+      -- ^ The requester's receipt of the output.
+    funding : Optional (ContractId Allocation)
+      -- ^ The requester's input, when the request was not funded.
+  deriving (Eq, Show)
+
+-- Vault state
+--------------
+
+-- | The state of one vault: its identity, its registries and its recorded
+-- accounting (`docs/SPEC.md` §4.1).
+--
+-- * Signatory: the operator. No observers: requesters read it by explicit
+--   disclosure (D-15).
+-- * `ensure`: a non-empty identifier of at most 245 characters; the share instrument is the
+--   operator's; the vault account is owned by the operator; the offset is
+--   within 0 to 10; `A` and `S` are not negative and within the asset and
+--   share bounds of `docs/MATH.md` §7; bounded texts and metadata. A create
+--   that breaks it fails with `PreconditionFailed`.
+-- * Choices: `Vault_ExecuteDeposits` and `Vault_ExecuteRedeems`, controlled
+--   by the executor (the operator, or in Permissionless mode a requester
+--   executing only its own requests); `Vault_AddAssets`, `Vault_Pause` and
+--   `Vault_Unpause`, controlled by the operator. Each consumes the state and
+--   creates its successor with the same identity fields (I-07).
+-- * Authorization: inside an execution, the operator's authority as
+--   signatory joins the executor's. The vault therefore checks the
+--   executor, the requests and every allocation before any settlement.
+-- * Disclosure: in Permissionless mode the operator also discloses the
+--   share registry's rules and, for a redemption, the vault-account
+--   holdings that pay it (`docs/SPEC.md` §5.4).
+-- * Failures: each choice fails with the identifiers of `docs/SPEC.md` §7,
+--   in the order of §5.3 to §5.6; a failed choice changes nothing.
+-- * Archival: the operator can archive the state and create another
+--   (`docs/SECURITY.md` §2, T-11); reconciliation against the share
+--   registry and the vault account detects it.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template VaultState
+  with
+    operator : Party
+      -- ^ The operator: signatory, executor in Permissioned mode, admin of the share instrument.
+    vaultId : Text
+      -- ^ The vault's identifier; the operator keeps it unique among its vaults.
+    asset : InstrumentId
+      -- ^ The underlying instrument.
+    shareInstrument : InstrumentId
+      -- ^ The share instrument, whose admin is the operator.
+    vaultAccount : Account
+      -- ^ The operator's account that holds the underlying.
+    mode : Mode
+      -- ^ Who executes requests (D-05).
+    assetRegistry : RegistryRef
+      -- ^ The underlying registry's factories.
+    shareRegistry : RegistryRef
+      -- ^ The share registry's factories.
+    decimalsOffset : Int
+      -- ^ The decimals offset `k`, from 0 to 10 (D-10).
+    totalAssets : Decimal
+      -- ^ The recorded underlying, `A` (D-06).
+    totalShares : Decimal
+      -- ^ The share supply, `S`.
+    paused : Bool
+      -- ^ Whether deposits and asset additions are paused (D-14).
+    meta : Metadata
+      -- ^ Extension data (D-12).
+  where
+    signatory operator
+    ensure not (T.isEmpty vaultId) && T.length vaultId <= maxVaultIdLength
+      && shareInstrument.admin == operator && vaultAccount.owner == Some operator
+      && boundedText asset.id && boundedText shareInstrument.id && boundedAccountId vaultAccount
+      && boundedMeta meta
+      && validState decimalsOffset totalAssets totalShares
+
+    interface instance Vault for VaultState where
+      view = VaultView with
+        operator; vaultId; asset; shareInstrument; totalAssets; totalShares; decimalsOffset; mode; paused; meta
+
+    postconsuming choice Vault_ExecuteDeposits : ExecResult
+      -- ^ Execute a batch of deposits (`docs/SPEC.md` §5.3).
+      with
+        executor : Party
+          -- ^ The submitting party.
+        items : [DepositItem]
+          -- ^ The requests, in execution order.
+        assetContext : ExtraArgs
+          -- ^ The underlying registry's choice context.
+        shareContext : ExtraArgs
+          -- ^ The share registry's choice context.
+      controller executor
+      do
+        executorBeforeRead this executor
+        batchBeforeRead Deposit this executor (map (\i -> coerceContractId i.request) items)
+        requests <- forA items (\i -> fetch i.request)
+        let entries = zipWith (depositEntry self assetContext shareContext) items requests
+        execute Deposit this executor entries assetContext shareContext
+
+    postconsuming choice Vault_ExecuteRedeems : ExecResult
+      -- ^ Execute a batch of redemptions (`docs/SPEC.md` §5.4).
+      with
+        executor : Party
+          -- ^ The submitting party.
+        items : [RedeemItem]
+          -- ^ The requests, in execution order.
+        assetContext : ExtraArgs
+          -- ^ The underlying registry's choice context.
+        shareContext : ExtraArgs
+          -- ^ The share registry's choice context.
+      controller executor
+      do
+        executorBeforeRead this executor
+        batchBeforeRead Redeem this executor (map (\i -> coerceContractId i.request) items)
+        requests <- forA items (\i -> fetch i.request)
+        let entries = zipWith (redeemEntry self assetContext shareContext) items requests
+        execute Redeem this executor entries assetContext shareContext
+
+    choice Vault_AddAssets : ContractId VaultState
+      -- ^ Settle `amount` of underlying from `source` into the vault account
+      -- and add it to `A`, minting no shares (`docs/SPEC.md` §5.5).
+      with
+        amount : Decimal
+          -- ^ The underlying added.
+        source : Account
+          -- ^ The account that sends it.
+        funding : ContractId Allocation
+          -- ^ The source's allocation of the leg into the vault account.
+        assetContext : ExtraArgs
+          -- ^ The underlying registry's choice context.
+      controller operator
+      do
+        when paused $ raise vaultPaused
+        unless (amount > 0.0) $ raise vaultInvalidAmount
+        unless (totalShares > 0.0) $ raise vaultNoShares
+        unless (amount <= assetCap decimalsOffset - unit - totalAssets) $ raise vaultCapacityExceeded
+        -- A leg from the vault account to itself brings nothing into custody.
+        when (source == vaultAccount) $ raise vaultAllocationMismatch
+        let settlement = addAssetsSettlement operator vaultId (coerceContractId self)
+            leg = addAssetsLeg vaultAccount asset source amount
+        f <- fetch funding
+        unless (fundingMatchesAdd (view f) settlement asset.admin source leg) $ raise vaultAllocationMismatch
+        vaultIn <- allocateAt assetRegistry.allocationFactory settlement
+          (allocationSpec asset.admin vaultAccount (receiverSide leg) None False) [] assetContext operator
+        same <- sameTemplate funding vaultIn
+        unless same $ raise vaultAllocationMismatch
+        settleAt assetRegistry.settlementFactory settlement leg [funding, vaultIn] assetContext operator
+        create this with totalAssets = totalAssets + amount
+
+    choice Vault_Pause : ContractId VaultState
+      -- ^ Pause deposits and asset additions (D-14).
+      controller operator
+      do
+        when paused $ raise vaultAlreadyPaused
+        create this with paused = True
+
+    choice Vault_Unpause : ContractId VaultState
+      -- ^ Resume deposits and asset additions (D-14).
+      controller operator
+      do
+        unless paused $ raise vaultNotPaused
+        create this with paused = False
+
+-- | The longest vault identifier: every settlement identifier is built from
+-- it, the longest being `<vaultId>/add-assets`, and the share registry
+-- bounds settlement identifiers at `maxTextLength` (`docs/SPEC.md` §4.1;
+-- `test_vaultState_longestIdentifierExecutes`).
+maxVaultIdLength : Int
+maxVaultIdLength = maxTextLength - T.length "/add-assets"
+
+-- | Whether an asset addition's allocation is bound to it (`docs/SPEC.md` §5.5).
+fundingMatchesAdd : AllocationView -> SettlementInfo -> Party -> Account -> TransferLeg -> Bool
+fundingMatchesAdd v settlement admin source leg =
+  v.settlement == settlement
+    && v.allocation.admin == admin
+    && v.allocation.authorizer == source
+    && v.allocation.transferLegSides == [senderSide leg]
+    && isNone v.allocation.nextIterationFunding
+
+-- Execution
+------------
+
+-- | A request, as the execution sees it.
+data Entry = Entry with
+    requestCid : AnyContractId
+    requester : Party
+    operator : Party
+    vaultId : Text
+    payAccount : Account
+    receiver : Account
+    amount : Decimal
+    minOut : Decimal
+    deadline : Time
+    funded : Bool
+    fundingAllocation : Optional (ContractId Allocation)
+    vaultInputs : [ContractId Holding]
+    delegate : TransferLeg -> Update RequestAllocations
+      -- ^ The request's delegation choice, exercised by this vault with the output leg.
+
+depositEntry : ContractId VaultState -> ExtraArgs -> ExtraArgs -> DepositItem -> DepositRequest -> Entry
+depositEntry vault assetContext shareContext item r = Entry with
+  requestCid = coerceContractId item.request
+  requester = r.requester; operator = r.operator; vaultId = r.vaultId
+  payAccount = r.payAccount; receiver = r.receiver; amount = r.amount; minOut = r.minOut
+  deadline = r.deadline; funded = r.funded
+  fundingAllocation = item.fundingAllocation
+  vaultInputs = []
+  delegate = \leg -> exercise item.request DepositRequest_Allocate with
+    vault; receiptLeg = leg; fundingInputs = item.fundingInputs; assetContext; shareContext
+
+redeemEntry : ContractId VaultState -> ExtraArgs -> ExtraArgs -> RedeemItem -> RedeemRequest -> Entry
+redeemEntry vault assetContext shareContext item r = Entry with
+  requestCid = coerceContractId item.request
+  requester = r.requester; operator = r.operator; vaultId = r.vaultId
+  payAccount = r.payAccount; receiver = r.receiver; amount = r.amount; minOut = r.minOut
+  deadline = r.deadline; funded = r.funded
+  fundingAllocation = item.fundingAllocation
+  vaultInputs = item.vaultInputs
+  delegate = \leg -> exercise item.request RedeemRequest_Allocate with
+    vault; receiptLeg = leg; fundingInputs = item.fundingInputs; assetContext; shareContext
+
+-- | `docs/SPEC.md` §5.3 step 1, before any request is read: in Permissioned
+-- mode only the operator executes.
+executorBeforeRead : VaultState -> Party -> Update ()
+executorBeforeRead v executor =
+  when (executor /= v.operator && v.mode == Permissioned) $ raise vaultUnauthorizedExecutor
+
+-- | Checks 2 to 4 of `docs/SPEC.md` §5.3 need no request content. When the
+-- operator executes, check 1 cannot fail after the read, so they run before
+-- any request is fetched, in the same order: an inactive or invisible
+-- request cannot hide them (`test_order_batchChecksBeforeRead`). `execute` runs them again.
+batchBeforeRead : Kind -> VaultState -> Party -> [AnyContractId] -> Update ()
+batchBeforeRead kind v executor requestCids = when (executor == v.operator) $ batchChecks kind v requestCids
+
+-- | Checks 2 to 4 of `docs/SPEC.md` §5.3, on the requests' contract IDs.
+batchChecks : Kind -> VaultState -> [AnyContractId] -> Update ()
+batchChecks kind v requestCids = do
+  -- Step 2: deposits only while not paused.
+  when (kind == Deposit && v.paused) $ raise vaultPaused
+  -- Step 3: 1 to 25 requests.
+  unless (not (null requestCids) && length requestCids <= maxBatchSize) $ raise vaultBatchSize
+  -- Step 4: no request twice.
+  unless (unique requestCids) $ raise vaultDuplicateRequest
+
+-- | A request after the vault's checks: its legs, its settlement and its output.
+data Planned = Planned with
+    entry : Entry
+    settlement : SettlementInfo
+    input : TransferLeg
+    output : TransferLeg
+
+-- | A planned request with every allocation created and checked.
+data Prepared = Prepared with
+    planned : Planned
+    inputAllocations : [ContractId Allocation]
+    outputAllocations : [ContractId Allocation]
+
+-- | The view of the state with the running totals.
+runningView : VaultState -> Decimal -> Decimal -> VaultView
+runningView v a s = view (toInterface @Vault (v with totalAssets = a; totalShares = s))
+
+-- | Execute a batch of one kind (`docs/SPEC.md` §5.3, §5.4): the batch
+-- checks, then every request's checks, then every allocation, then every
+-- settlement; then the successor.
+execute : Kind -> VaultState -> Party -> [Entry] -> ExtraArgs -> ExtraArgs -> Update ExecResult
+execute kind v executor entries assetContext shareContext = do
+  -- Step 1, in Permissionless mode: every request is the executor's own.
+  when (executor /= v.operator && any (\e -> e.requester /= executor) entries) $ raise vaultUnauthorizedExecutor
+  -- Steps 2 to 4.
+  batchChecks kind v (map (.requestCid) entries)
+  -- Steps 5 to 12, per request in list order, on the running state.
+  (plannedRev, a, s) <- foldlA (checkRequest kind v) ([], v.totalAssets, v.totalShares) entries
+  let planned = reverse plannedRev
+  -- Every allocation, created and checked before any settlement (`docs/SPEC.md` §5.3). A
+  -- redemption's vault allocation also spends the change of the previous
+  -- one (`docs/SPEC.md` §5.4).
+  (preparedRev, _) <- foldlA (\(acc, change) p -> do
+      (q, change') <- prepare kind v assetContext shareContext change p
+      pure (q :: acc, change'))
+    ([], []) planned
+  let prepared = reverse preparedRev
+  -- Every settlement.
+  forA_ prepared (settle kind v assetContext shareContext)
+  successor <- create v with totalAssets = a; totalShares = s
+  pure ExecResult with successor; outputs = map (\p -> p.output.amount) planned
+
+-- | Steps 5 to 12 for one request.
+checkRequest : Kind -> VaultState -> ([Planned], Decimal, Decimal) -> Entry -> Update ([Planned], Decimal, Decimal)
+checkRequest kind v (acc, a, s) e = do
+  -- Step 5: the request names this vault.
+  unless (e.operator == v.operator && e.vaultId == v.vaultId) $ raise vaultWrongVault
+  -- Step 6: before the deadline, the predicate of the settlement's own deadline check.
+  open <- isLedgerTimeLT e.deadline
+  unless open $ raise vaultRequestExpired
+  -- Step 7: a funded request's allocation is bound to it; an unfunded one has none.
+  let settlement = requestSettlement v.operator v.vaultId kind e.requestCid
+      input = inLeg kind v.vaultAccount v.asset v.shareInstrument e.payAccount e.amount
+      inputAdmin = if kind == Deposit then v.asset.admin else v.shareInstrument.admin
+  case (e.funded, e.fundingAllocation) of
+    (True, Some f) -> do
+      allocation <- fetch f
+      unless (fundingMatches (view allocation) settlement inputAdmin e.payAccount input e.deadline) $
+        raise vaultAllocationMismatch
+    (False, None) -> pure ()
+    _ -> raise vaultAllocationMismatch
+  let k = v.decimalsOffset
+  if kind == Deposit
+    then do
+      -- Step 8: the asset bound, before the conversion.
+      unless (e.amount <= assetCap k - unit - a) $ raise vaultCapacityExceeded
+      -- Step 9.
+      let shares = previewDeposit (runningView v a s) e.amount
+      -- Steps 10 to 12.
+      unless (shares > 0.0) $ raise vaultZeroShares
+      unless (shares >= e.minOut) $ raise vaultSlippage
+      unless (shares <= shareCap k - virtualShares k - s) $ raise vaultCapacityExceeded
+      let output = outLeg kind v.vaultAccount v.asset v.shareInstrument e.receiver shares
+      pure (Planned with entry = e; settlement; input; output :: acc, a + e.amount, s + shares)
+    else do
+      -- Step 9.
+      let assets = previewRedeem (runningView v a s) e.amount
+      -- Steps 10 to 12.
+      unless (assets > 0.0) $ raise vaultZeroAssets
+      unless (assets >= e.minOut) $ raise vaultSlippage
+      -- More shares than `S` exist only outside the vault (T-13); refuse them
+      -- here rather than at the successor's `ensure` (`test_vault_insufficientAssets_amountAboveSupply`).
+      unless (e.amount <= s && assets <= a) $ raise vaultInsufficientAssets
+      let output = outLeg kind v.vaultAccount v.asset v.shareInstrument e.receiver assets
+      pure (Planned with entry = e; settlement; input; output :: acc, a - assets, s - e.amount)
+
+-- | The request's delegation, the vault's own allocations, and the template
+-- identity check of a funded request's allocation. `change` is what the
+-- previous redemption's vault allocation returned to the vault account; the
+-- result carries this one's.
+prepare : Kind -> VaultState -> ExtraArgs -> ExtraArgs -> [ContractId Holding] -> Planned -> Update (Prepared, [ContractId Holding])
+prepare kind v assetContext shareContext change p = do
+  let e = p.entry
+  allocations <- e.delegate p.output
+  funding <- case (allocations.funding, e.fundingAllocation) of
+    (Some f, None) -> pure f
+    (None, Some f) -> pure f
+    _ -> raise vaultAllocationMismatch
+  let deadline = Some e.deadline
+      (inRegistry, inAdmin, inContext, vaultInSide) =
+        if kind == Deposit then (v.assetRegistry, v.asset.admin, assetContext, v.vaultAccount)
+        else (v.shareRegistry, v.shareInstrument.admin, shareContext, burnAccount)
+      (outRegistry, outAdmin, outContext, vaultOutSide) =
+        if kind == Deposit then (v.shareRegistry, v.shareInstrument.admin, shareContext, mintAccount)
+        else (v.assetRegistry, v.asset.admin, assetContext, v.vaultAccount)
+  vaultIn <- allocateAt inRegistry.allocationFactory p.settlement
+    (allocationSpec inAdmin vaultInSide (receiverSide p.input) deadline False) [] inContext v.operator
+  when (isSome e.fundingAllocation) $ do
+    same <- sameTemplate funding vaultIn
+    unless same $ raise vaultAllocationMismatch
+  (vaultOut, change') <- if kind == Deposit
+    then (\c -> (c, [])) <$> allocateAt outRegistry.allocationFactory p.settlement
+      (allocationSpec outAdmin vaultOutSide (senderSide p.output) deadline False) [] outContext v.operator
+    else allocateWithChange outRegistry.allocationFactory p.settlement
+      (allocationSpec outAdmin vaultOutSide (senderSide p.output) deadline False) (e.vaultInputs ++ change) outContext v.operator
+      v.asset.id
+  let prepared = Prepared with
+        planned = p
+        inputAllocations = [funding, vaultIn]
+        outputAllocations = [vaultOut, allocations.receipt]
+  pure (prepared, change')
+
+-- | The two settlements of a request.
+settle : Kind -> VaultState -> ExtraArgs -> ExtraArgs -> Prepared -> Update ()
+settle kind v assetContext shareContext p = do
+  let (inRegistry, inContext, outRegistry, outContext) =
+        if kind == Deposit then (v.assetRegistry, assetContext, v.shareRegistry, shareContext)
+        else (v.shareRegistry, shareContext, v.assetRegistry, assetContext)
+  settleAt inRegistry.settlementFactory p.planned.settlement p.planned.input p.inputAllocations inContext v.operator
+  settleAt outRegistry.settlementFactory p.planned.settlement p.planned.output p.outputAllocations outContext v.operator
+
+-- Requests
+-----------
+
+-- | A requester's offer to deposit `amount` of underlying for at least
+-- `minOut` shares before `deadline` (`docs/SPEC.md` §4.2).
+--
+-- * Signatory: the requester. Observer: the operator.
+-- * `ensure`: `amount > 0` and `minOut >= 0`, else `vault-invalid-amount`;
+--   bounded texts and metadata, else `PreconditionFailed`.
+-- * `DepositRequest_Allocate`: controlled by the operator, exercised by the
+--   vault's execution; the requester's delegation of its allocations, with
+--   the checks of `docs/SPEC.md` §4.2. Consuming: it runs at most once.
+-- * `DepositRequest_Cancel`: controlled by the requester; withdraws the
+--   request's allocations it is given and archives the request.
+-- * Disclosure: the operator sees the request as its observer; in
+--   Permissionless mode the requester executes it with the vault state
+--   disclosed by the operator (D-15).
+-- * Authorization: the requester's signature backs only the allocations
+--   that `DepositRequest_Allocate` creates, bound to this request's
+--   settlement, legs and deadline; the vault settles them only after its
+--   own checks (`docs/SPEC.md` §4.2).
+-- * Failures: `vault-wrong-vault`, `vault-request-expired`,
+--   `vault-allocation-mismatch` and `vault-slippage` from
+--   `DepositRequest_Allocate`, in that order; `vault-allocation-mismatch`
+--   from `DepositRequest_Cancel` for an allocation of another request.
+-- * Archival: consumed by its execution or by `DepositRequest_Cancel`; the
+--   requester can also archive it directly, which leaves its allocations
+--   in place.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template DepositRequest
+  with
+    requester : Party
+      -- ^ The party that deposits.
+    operator : Party
+      -- ^ The operator of the target vault.
+    vaultId : Text
+      -- ^ The target vault.
+    payAccount : Account
+      -- ^ The requester's account that sends the underlying.
+    receiver : Account
+      -- ^ The account that receives the shares.
+    amount : Decimal
+      -- ^ The underlying offered.
+    minOut : Decimal
+      -- ^ The fewest shares accepted.
+    deadline : Time
+      -- ^ The last instant of execution, exclusive.
+    funded : Bool
+      -- ^ Whether the requester allocated the input when it made the request.
+    meta : Metadata
+      -- ^ Extension data.
+  where
+    signatory requester
+    observer operator
+    ensure requestValid amount minOut
+      && T.length vaultId <= maxTextLength && boundedAccountId payAccount && boundedAccountId receiver && boundedMeta meta
+
+    choice DepositRequest_Allocate : RequestAllocations
+      -- ^ Create the requester's receipt allocation for the shares and, when
+      -- the request is not funded, its input allocation (`docs/SPEC.md` §4.2).
+      with
+        vault : ContractId VaultState
+          -- ^ The executing vault, checked against this request.
+        receiptLeg : TransferLeg
+          -- ^ The output leg, with the shares the vault computed.
+        fundingInputs : [ContractId Holding]
+          -- ^ The requester's underlying holdings, when the request is not funded.
+        assetContext : ExtraArgs
+          -- ^ The underlying registry's choice context.
+        shareContext : ExtraArgs
+          -- ^ The share registry's choice context.
+      controller operator
+      do
+        delegateAllocations Deposit (coerceContractId self) requester operator vaultId payAccount receiver
+          amount minOut deadline funded vault receiptLeg fundingInputs assetContext shareContext
+
+    choice DepositRequest_Cancel : ()
+      -- ^ Withdraw the given allocations of this request and archive it
+      -- (`docs/SPEC.md` §5.8).
+      with
+        allocations : [ContractId Allocation]
+          -- ^ This request's allocations to withdraw.
+        extraArgs : ExtraArgs
+          -- ^ The registry's choice context for the withdrawals.
+      controller requester
+      do
+        withdrawRequestAllocations Deposit (coerceContractId self) requester operator vaultId allocations extraArgs
+
+-- | A requester's offer to redeem `amount` shares for at least `minOut`
+-- underlying before `deadline` (`docs/SPEC.md` §4.2).
+--
+-- * Signatory: the requester. Observer: the operator.
+-- * `ensure`: `amount > 0` and `minOut >= 0`, else `vault-invalid-amount`;
+--   bounded texts and metadata, else `PreconditionFailed`.
+-- * `RedeemRequest_Allocate`: controlled by the operator, exercised by the
+--   vault's execution; the requester's delegation of its allocations, with
+--   the checks of `docs/SPEC.md` §4.2. Consuming: it runs at most once.
+-- * `RedeemRequest_Cancel`: controlled by the requester; withdraws the
+--   request's allocations it is given and archives the request.
+-- * Disclosure: the operator sees the request as its observer; in
+--   Permissionless mode the requester executes it with the vault state
+--   disclosed by the operator (D-15).
+-- * Authorization: the requester's signature backs only the allocations
+--   that `RedeemRequest_Allocate` creates, bound to this request's
+--   settlement, legs and deadline; the vault settles them only after its
+--   own checks (`docs/SPEC.md` §4.2).
+-- * Failures: `vault-wrong-vault`, `vault-request-expired`,
+--   `vault-allocation-mismatch` and `vault-slippage` from
+--   `RedeemRequest_Allocate`, in that order; `vault-allocation-mismatch`
+--   from `RedeemRequest_Cancel` for an allocation of another request.
+-- * Archival: consumed by its execution or by `RedeemRequest_Cancel`; the
+--   requester can also archive it directly, which leaves its allocations
+--   in place.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template RedeemRequest
+  with
+    requester : Party
+      -- ^ The party that redeems.
+    operator : Party
+      -- ^ The operator of the target vault.
+    vaultId : Text
+      -- ^ The target vault.
+    payAccount : Account
+      -- ^ The requester's account that sends the shares.
+    receiver : Account
+      -- ^ The account that receives the underlying.
+    amount : Decimal
+      -- ^ The shares offered.
+    minOut : Decimal
+      -- ^ The least underlying accepted.
+    deadline : Time
+      -- ^ The last instant of execution, exclusive.
+    funded : Bool
+      -- ^ Whether the requester allocated the input when it made the request.
+    meta : Metadata
+      -- ^ Extension data.
+  where
+    signatory requester
+    observer operator
+    ensure requestValid amount minOut
+      && T.length vaultId <= maxTextLength && boundedAccountId payAccount && boundedAccountId receiver && boundedMeta meta
+
+    choice RedeemRequest_Allocate : RequestAllocations
+      -- ^ Create the requester's receipt allocation for the underlying and,
+      -- when the request is not funded, its share allocation (`docs/SPEC.md` §4.2).
+      with
+        vault : ContractId VaultState
+          -- ^ The executing vault, checked against this request.
+        receiptLeg : TransferLeg
+          -- ^ The output leg, with the underlying the vault computed.
+        fundingInputs : [ContractId Holding]
+          -- ^ The requester's share holdings, when the request is not funded.
+        assetContext : ExtraArgs
+          -- ^ The underlying registry's choice context.
+        shareContext : ExtraArgs
+          -- ^ The share registry's choice context.
+      controller operator
+      do
+        delegateAllocations Redeem (coerceContractId self) requester operator vaultId payAccount receiver
+          amount minOut deadline funded vault receiptLeg fundingInputs assetContext shareContext
+
+    choice RedeemRequest_Cancel : ()
+      -- ^ Withdraw the given allocations of this request and archive it
+      -- (`docs/SPEC.md` §5.8).
+      with
+        allocations : [ContractId Allocation]
+          -- ^ This request's allocations to withdraw.
+        extraArgs : ExtraArgs
+          -- ^ The registry's choice context for the withdrawals.
+      controller requester
+      do
+        withdrawRequestAllocations Redeem (coerceContractId self) requester operator vaultId allocations extraArgs
+
+-- | The checks and effects of a request's delegation choice (`docs/SPEC.md`
+-- §4.2), in order: the vault, the deadline, the output leg, the slippage.
+delegateAllocations
+  : Kind -> AnyContractId -> Party -> Party -> Text -> Account -> Account -> Decimal -> Decimal -> Time -> Bool
+  -> ContractId VaultState -> TransferLeg -> [ContractId Holding] -> ExtraArgs -> ExtraArgs
+  -> Update RequestAllocations
+delegateAllocations kind self requester operator vaultId payAccount receiver amount minOut deadline funded
+    vault receiptLeg fundingInputs assetContext shareContext = do
+  v <- fetch vault
+  unless (v.operator == operator && v.vaultId == vaultId) $ raise vaultWrongVault
+  open <- isLedgerTimeLT deadline
+  unless open $ raise vaultRequestExpired
+  let expected = outLeg kind v.vaultAccount v.asset v.shareInstrument receiver receiptLeg.amount
+  unless (receiptLeg == expected) $ raise vaultAllocationMismatch
+  unless (receiptLeg.amount > 0.0 && receiptLeg.amount >= minOut) $ raise vaultSlippage
+  let settlement = requestSettlement operator vaultId kind self
+      (outRegistry, outAdmin, outContext) =
+        if kind == Deposit then (v.shareRegistry, v.shareInstrument.admin, shareContext)
+        else (v.assetRegistry, v.asset.admin, assetContext)
+      (inRegistry, inAdmin, inContext) =
+        if kind == Deposit then (v.assetRegistry, v.asset.admin, assetContext)
+        else (v.shareRegistry, v.shareInstrument.admin, shareContext)
+  receipt <- allocateAt outRegistry.allocationFactory settlement
+    (allocationSpec outAdmin receiver (receiverSide receiptLeg) (Some deadline) False) [] outContext requester
+  funding <- if funded then pure None else do
+    let input = inLeg kind v.vaultAccount v.asset v.shareInstrument payAccount amount
+    Some <$> allocateAt inRegistry.allocationFactory settlement
+      (allocationSpec inAdmin payAccount (senderSide input) (Some deadline) False) fundingInputs inContext requester
+  pure RequestAllocations with receipt; funding
+
+-- | Withdraw a request's allocations, each of which must carry its
+-- settlement, else `vault-allocation-mismatch`.
+withdrawRequestAllocations
+  : Kind -> AnyContractId -> Party -> Party -> Text -> [ContractId Allocation] -> ExtraArgs -> Update ()
+withdrawRequestAllocations kind self requester operator vaultId allocations extraArgs = do
+  let settlement = requestSettlement operator vaultId kind self
+  forA_ allocations $ \cid -> do
+    allocation <- fetch cid
+    unless ((view allocation).settlement == settlement) $ raise vaultAllocationMismatch
+    exercise cid Allocation_Withdraw with actors = [requester]; extraArgs

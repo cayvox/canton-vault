@@ -1,0 +1,43 @@
+name: Set up Daml
+description: Install Java, dpm and the requested Daml SDKs.
+
+# dpm and the SDKs are installed by the method of the dpm documentation:
+# https://docs.canton.network/sdks-tools/cli-tools/dpm
+# ("curl https://get.digitalasset.com/install/install.sh | sh", then
+# "dpm install <version>"). dpm needs a JDK 17 or later.
+
+inputs:
+  sdks:
+    description: Space-separated Daml SDK versions to install
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Java 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "21"
+
+    - name: Cache dpm and the SDKs
+      uses: actions/cache@v4
+      with:
+        path: ~/.dpm
+        key: dpm-${{ runner.os }}-${{ inputs.sdks }}-v1
+
+    - name: Install dpm and the SDKs
+      shell: bash
+      env:
+        SDKS: ${{ inputs.sdks }}
+      run: |
+        set -euo pipefail
+        if [ ! -x "$HOME/.dpm/bin/dpm" ]; then
+          curl -fsSL https://get.digitalasset.com/install/install.sh | sh
+        fi
+        echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.dpm/bin:$PATH"
+        for sdk in $SDKS; do
+          dpm install "$sdk"
+        done
+        dpm version

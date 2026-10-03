@@ -1,0 +1,229 @@
+-- | Vault scenarios (`docs/SPEC.md` §5): deposits, redemptions and
+-- cancellations in both modes and both funding variants; pause; asset
+-- additions; batches of 25 and 26. Each ends with the vault reconciled
+-- against the share registry and the vault account (I-01, I-02).
+module Cayvox.VaultV1Test.VaultScenarios where
+
+import DA.Assert ((===))
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, days, microseconds)
+import Daml.Script
+
+import qualified Splice.Api.Token.AllocationInstructionV2 as V2
+import qualified Splice.Api.Token.AllocationV2 as V2A
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount, senderSide)
+import Cayvox.VaultV1.Internal.Vault (Kind (..), allocationSpec, inLeg, requestSettlement)
+import Cayvox.VaultV1Test.Underlying
+
+import Cayvox.Api.VaultV1 (Vault, VaultView (..))
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1
+import Cayvox.VaultV1Test.VaultSetup
+
+-- | The vault's failure with the given name.
+vaultErr : Text -> Expected
+vaultErr name = Status ("cayvox.com/vault-" <> name) InvalidGivenCurrentSystemStateOther
+
+-- | Deposit then redeem, for one mode, offset and funding variant: balances,
+-- totals and reconciliation after each step.
+depositThenRedeem : Text -> Mode -> Int -> Bool -> Script ()
+depositThenRedeem tag mode k funded = do
+  w <- setupWorld tag mode k 1
+  let [alice] = w.requesters
+      executor = if mode == Permissioned then w.operator else alice
+  d <- newDeposit w alice 100.0 0.0 funded
+  di <- depositItem w alice d
+  j1 <- executeDeposits w executor [(alice, di)] >>= journaled w
+  let minted = if k == 0 then 100.0 else 1000000000000.0
+      quarter = if k == 0 then 25.0 else 250000000000.0
+  positionOf w alice >>= (=== ((900.0, 0.0), (minted, 0.0)))
+  totalsOf w >>= (=== (100.0, minted))
+  r <- newRedeem w alice quarter 0.0 funded
+  ri <- redeemItem w alice r
+  j2 <- executeRedeems w executor [(alice, ri)] >>= journaled w
+  positionOf w alice >>= (=== ((925.0, 0.0), (minted - quarter, 0.0)))
+  totalsOf w >>= (=== (75.0, minted - quarter))
+  rec <- reconcile w (j1 + j2)
+  check ("reconciles: " <> show rec) (reconciles rec)
+
+test_vault_depositRedeem_permissionedUnfunded : Script ()
+test_vault_depositRedeem_permissionedUnfunded = depositThenRedeem "pu" Permissioned 0 False
+
+test_vault_depositRedeem_permissionedFunded : Script ()
+test_vault_depositRedeem_permissionedFunded = depositThenRedeem "pf" Permissioned 0 True
+
+test_vault_depositRedeem_permissionlessUnfunded : Script ()
+test_vault_depositRedeem_permissionlessUnfunded = depositThenRedeem "lu" Permissionless 10 False
+
+test_vault_depositRedeem_permissionlessFunded : Script ()
+test_vault_depositRedeem_permissionlessFunded = depositThenRedeem "lf" Permissionless 10 True
+
+check : Text -> Bool -> Script ()
+check label cond = if cond then pure () else abort label
+
+-- Cancellation (`docs/SPEC.md` §5.8)
+-------------------------------------
+
+-- | An unfunded request is cancelled with no allocation to withdraw.
+test_vault_cancel_unfundedRequests : Script ()
+test_vault_cancel_unfundedRequests = do
+  w <- setupWorld "cancel-unfunded" Permissioned 0 1
+  let [alice] = w.requesters
+  (d, _) <- newDeposit w alice 100.0 0.0 False
+  run =<< cancelDeposit w alice d []
+  assertArchived alice d
+  _ <- run =<< depositAll w w.operator [(alice, 100.0, False)]
+  (r, _) <- newRedeem w alice 10.0 0.0 False
+  run =<< cancelRedeem w alice r []
+  assertArchived alice r
+  positionOf w alice >>= (=== ((900.0, 0.0), (100.0, 0.0)))
+
+-- | A request funded with an uncommitted allocation is cancelled in one
+-- step: the request is archived and the allocation withdrawn (`docs/SPEC.md` §5.8).
+test_vault_cancel_uncommittedFundingInOneStep : Script ()
+test_vault_cancel_uncommittedFundingInOneStep = do
+  w <- setupWorld "cancel-uncommitted" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  d <- submit alice $ createCmd DepositRequest with
+    requester = alice; operator = w.operator; vaultId = w.vaultId
+    payAccount = basicAccount alice; receiver = basicAccount alice
+    amount = 100.0; minOut = 0.0; deadline; funded = True; meta = emptyMetadata
+  (_, v) <- vaultOf w
+  inputs <- underlyingHoldings w.underlying alice
+  ud <- underlyingDisclosure w.underlying
+  let leg = inLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount alice) 100.0
+  res <- submit (actAs alice <> disclose ud) $
+    exerciseCmd (toInterfaceContractId @V2.AllocationFactory w.underlying.rules) V2.AllocationFactory_Allocate with
+      settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId d)
+      allocation = allocationSpec w.underlying.admin (basicAccount alice) (senderSide leg) (Some deadline) False
+      requestedAt = now; inputHoldingCids = inputs; extraArgs = underlyingArgs w.underlying; actors = [alice]
+  alloc <- completed res
+  positionOf w alice >>= (=== ((900.0, 100.0), (0.0, 0.0)))
+  run =<< cancelDeposit w alice d [alloc]
+  assertArchived alice d
+  positionOf w alice >>= (=== ((1000.0, 0.0), (0.0, 0.0)))
+
+-- | A request funded with a committed allocation is archived at once; its
+-- allocation is withdrawn after the deadline (`docs/SPEC.md` §5.8).
+test_vault_cancel_committedFundingAfterDeadline : Script ()
+test_vault_cancel_committedFundingAfterDeadline = do
+  w <- setupWorld "cancel-committed" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  (d, Some alloc) <- newDepositUntil w alice 100.0 0.0 True deadline
+  tryS (cancelDeposit w alice d [alloc])
+    >>= assertFails (Status "splice.lfdecentralizedtrust.org/cannot-withdraw-committed-allocation" InvalidGivenCurrentSystemStateOther)
+  run =<< cancelDeposit w alice d []
+  assertArchived alice d
+  setTime (addRelTime deadline (microseconds 1))
+  ud <- underlyingDisclosure w.underlying
+  _ <- submit (actAs alice <> disclose ud) $ exerciseCmd alloc V2A.Allocation_Withdraw with
+    actors = [alice]; extraArgs = underlyingArgs w.underlying
+  positionOf w alice >>= (=== ((1000.0, 0.0), (0.0, 0.0)))
+
+-- | A requester can also archive its own requests directly; an archived
+-- request cannot execute.
+test_vault_requesterArchivesRequests : Script ()
+test_vault_requesterArchivesRequests = do
+  w <- setupWorld "archive" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  d <- newDeposit w alice 10.0 0.0 False
+  r <- newRedeem w alice 1.0 0.0 False
+  di <- depositItem w alice d
+  submit alice $ archiveCmd (fst d)
+  submit alice $ archiveCmd (fst r)
+  assertArchived alice (fst d)
+  assertArchived alice (fst r)
+  tryS (executeDeposits w w.operator [(alice, di)]) >>= assertFails (ContractUnavailable (show (fst d)))
+
+-- Pause (D-14)
+---------------
+
+-- | While paused, deposits and asset additions fail and redemptions and
+-- cancellations work; after unpausing, deposits work again.
+test_vault_pause_blocksDepositsAndAdditionsOnly : Script ()
+test_vault_pause_blocksDepositsAndAdditionsOnly = do
+  forA_ [Permissioned, Permissionless] $ \mode -> do
+    w <- setupWorld ("pause-" <> show mode) mode 0 1
+    let [alice] = w.requesters
+        executor = if mode == Permissioned then w.operator else alice
+    _ <- run =<< depositAll w executor [(alice, 100.0, False)]
+    _ <- run =<< pause w
+    tryS (depositAll w executor [(alice, 10.0, False)]) >>= assertFails (vaultErr "paused")
+    tryS (addAssets w 5.0) >>= assertFails (vaultErr "paused")
+    _ <- run =<< redeemAll w executor [(alice, 40.0, False)]
+    (r, _) <- newRedeem w alice 10.0 0.0 False
+    run =<< cancelRedeem w alice r []
+    _ <- run =<< unpause w
+    _ <- run =<< depositAll w executor [(alice, 10.0, False)]
+    totalsOf w >>= (=== (70.0, 70.0))
+
+-- | Pausing a paused vault and unpausing an active one fail.
+test_vault_pause_twiceAndUnpauseActive : Script ()
+test_vault_pause_twiceAndUnpauseActive = do
+  w <- setupWorld "pause-twice" Permissioned 0 0
+  tryS (unpause w) >>= assertFails (vaultErr "not-paused")
+  _ <- run =<< pause w
+  tryS (pause w) >>= assertFails (vaultErr "already-paused")
+  _ <- run =<< unpause w
+  (_, v) <- vaultOf w
+  v.paused === False
+
+-- Asset additions (`docs/SPEC.md` §5.5, D-08)
+----------------------------------------------
+
+-- | Assets added raise A, mint nothing, raise the price, and reconcile;
+-- with S = 0 they are refused.
+test_vault_addAssets_raisesPriceAndRefusesEmptyVault : Script ()
+test_vault_addAssets_raisesPriceAndRefusesEmptyVault = do
+  w <- setupWorld "add" Permissioned 0 1
+  let [alice] = w.requesters
+  tryS (addAssets w 10.0) >>= assertFails (vaultErr "no-shares")
+  j1 <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  j2 <- journaled w =<< addAssets w 50.0
+  totalsOf w >>= (=== (150.0, 100.0))
+  positionOf w alice >>= (=== ((900.0, 0.0), (100.0, 0.0)))
+  j3 <- journaled w =<< redeemAll w w.operator [(alice, 100.0, False)]
+  -- 100 shares of 150 assets, with one virtual share and asset unit:
+  -- 100 * (150 + u) divided by (100 + u), rounded down.
+  positionOf w alice >>= (=== ((1049.9999999999, 0.0), (0.0, 0.0)))
+  rec <- reconcile w (j1 + j2 + j3)
+  check ("reconciles: " <> show rec) (reconciles rec)
+
+-- Batches (D-16)
+-----------------
+
+-- | A batch of 25 deposits executes; 26 and none are refused.
+test_vault_batch_25AndNot26 : Script ()
+test_vault_batch_25AndNot26 = do
+  w <- setupWorld "batch" Permissioned 0 26
+  items <- forA w.requesters $ \p -> do
+    r <- newDeposit w p 10.0 0.0 False
+    i <- depositItem w p r
+    pure (p, i)
+  tryS (executeDeposits w w.operator items) >>= assertFails (vaultErr "batch-size")
+  tryS (executeDeposits w w.operator []) >>= assertFails (vaultErr "batch-size")
+  res <- run =<< executeDeposits w w.operator (take 25 items)
+  length res.outputs === 25
+  totalsOf w >>= (=== (250.0, 250.0))
+
+-- | The vault state's view, read through the `Vault` interface on the
+-- ledger, reports its fields.
+test_vault_viewThroughInterface : Script ()
+test_vault_viewThroughInterface = do
+  w <- setupWorld "view" Permissionless 10 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w alice [(alice, 2.0, False)]
+  (cid, v) <- vaultOf w
+  Some found <- queryInterfaceContractId @Vault w.operator (toInterfaceContractId cid)
+  found === VaultView with
+    operator = w.operator; vaultId = w.vaultId; asset = v.asset; shareInstrument = v.shareInstrument
+    totalAssets = 2.0; totalShares = 20000000000.0; decimalsOffset = 10; mode = Permissionless; paused = False
+    meta = v.meta

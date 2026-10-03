@@ -1,0 +1,80 @@
+-- | The conversion and preview functions of the vault (`docs/SPEC.md` §5.7),
+-- with the formulas and rounding directions of `docs/MATH.md` §7 (D-09).
+--
+-- Each takes a vault view, which gives `A` (`totalAssets`), `S`
+-- (`totalShares`) and `k` (`decimalsOffset`), and an amount. With `VA = u`
+-- and `VS = 10^k * u`, it fails in this order:
+--
+-- 1. `cayvox.com/vault-capacity-exceeded` for a view outside the reachable
+--    states of `docs/MATH.md` §7: `k` outside `0 <= k <= 10`, a negative `A`
+--    or `S`, `A + VA` above `floor(DMAX / 10^k)`, or `S + VS` above
+--    `10^k (A + VA)`. A view of a vault state reached through vault
+--    choices never fails here.
+-- 2. `cayvox.com/vault-capacity-exceeded` when a deposit or a mint of the
+--    amount would take `A` past its bound (`convertToShares`,
+--    `previewDeposit`, `previewMint`).
+-- 3. The failures of `mulDiv`: `cayvox.com/math-negative-operand` for a
+--    negative amount, `cayvox.com/math-overflow` for a result above `DMAX`.
+--
+-- Every failure has category `InvalidGivenCurrentSystemStateOther`. The
+-- functions are pure; a call bound by `let` fails even when its value is
+-- unused.
+module Cayvox.VaultV1.Conversion
+  ( convertToShares
+  , convertToAssets
+  , previewDeposit
+  , previewMint
+  , previewWithdraw
+  , previewRedeem
+  ) where
+
+import Cayvox.Api.VaultV1 (VaultView)
+import Cayvox.VaultMathV1 (Rounding (..), mulDiv)
+
+import Cayvox.VaultV1.Internal.Conversion
+
+-- | The shares worth `assets`, rounded down:
+-- `mulDiv Floor assets (S + VS) (A + VA)`. Fails when a deposit of `assets`
+-- would exceed the asset bound.
+convertToShares : VaultView -> Decimal -> Decimal
+convertToShares v assets =
+  let t = checkedTerms v
+  in if assets > t.room then capacityExceeded else mulDiv Floor assets t.shares t.assets
+
+-- | The assets worth `shares`, rounded down:
+-- `mulDiv Floor shares (A + VA) (S + VS)`.
+convertToAssets : VaultView -> Decimal -> Decimal
+convertToAssets v shares =
+  let t = checkedTerms v
+  in mulDiv Floor shares t.assets t.shares
+
+-- | The shares a deposit of `assets` mints, rounded down:
+-- `mulDiv Floor assets (S + VS) (A + VA)`. Fails when the deposit would
+-- exceed the asset bound.
+previewDeposit : VaultView -> Decimal -> Decimal
+previewDeposit v assets =
+  let t = checkedTerms v
+  in if assets > t.room then capacityExceeded else mulDiv Floor assets t.shares t.assets
+
+-- | The assets a mint of `shares` charges, rounded up:
+-- `mulDiv Ceil shares (A + VA) (S + VS)`. Fails when those assets would
+-- exceed the asset bound, which is checked before the conversion.
+previewMint : VaultView -> Decimal -> Decimal
+previewMint v shares =
+  let t = checkedTerms v
+  in if shares > mulDiv Floor t.room t.shares t.assets then capacityExceeded
+     else mulDiv Ceil shares t.assets t.shares
+
+-- | The shares a withdrawal of `assets` burns, rounded up:
+-- `mulDiv Ceil assets (S + VS) (A + VA)`.
+previewWithdraw : VaultView -> Decimal -> Decimal
+previewWithdraw v assets =
+  let t = checkedTerms v
+  in mulDiv Ceil assets t.shares t.assets
+
+-- | The assets a redemption of `shares` pays, rounded down:
+-- `mulDiv Floor shares (A + VA) (S + VS)`.
+previewRedeem : VaultView -> Decimal -> Decimal
+previewRedeem v shares =
+  let t = checkedTerms v
+  in mulDiv Floor shares t.assets t.shares

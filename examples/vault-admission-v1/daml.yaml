@@ -1,0 +1,17 @@
+sdk-version: 3.4.11
+name: com-example-vault-admission-v1
+source: daml
+version: 0.1.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../../packages/utils/vault-math-v1/.daml/dist/cvx-vault-math-v1-0.1.0.dar
+  - ../../packages/token/api-vault-v1/.daml/dist/cvx-api-vault-v1-0.1.0.dar
+  - ../../packages/token/vault-v1/.daml/dist/cvx-vault-v1-0.1.0.dar
+  - ../../dars/vendor/splice-api-token-metadata-v1-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-holding-v2-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-allocation-v2-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-allocation-instruction-v2-1.0.0.dar
+build-options:
+  - --target=2.1

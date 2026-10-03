@@ -1,0 +1,384 @@
+-- | Fixtures for the vault tests: a vault of operator V over a TestTokenV2
+-- underlying, with the share registry of `cvx-vault-v1`; requests funded or
+-- not; executions, asset additions, pauses and cancellations as
+-- submissions; balances; and the reconciliation of I-01 and I-02.
+module Cayvox.VaultV1Test.VaultSetup where
+
+import DA.Foldable (forA_)
+import DA.List (dedup, head)
+import qualified DA.Map as Map
+import DA.Optional (fromOptional, fromSome, isNone, isSome)
+import DA.Time (RelTime, addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.AllocationInstructionV2 as V2
+import qualified Splice.Api.Token.AllocationV2 as V2
+import qualified Splice.Api.Token.HoldingV2 as V2
+import Splice.Testing.Tokens.TestTokenV2 (Token (..))
+
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Internal.ShareRegistry (ShareHolding (..))
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount, senderSide)
+import Cayvox.VaultV1.Internal.Vault (Kind (..), allocationSpec, inLeg, requestSettlement)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+
+-- The world
+------------
+
+-- | A vault, its registries and its parties.
+data World = World with
+    underlying : Underlying
+    shares : S.Registry
+    operator : Party
+    vaultId : Text
+    requesters : [Party]
+    sponsor : Party
+      -- ^ Holds underlying that `Vault_AddAssets` brings in.
+    mode : Mode
+    k : Int
+
+-- | A vault of a fresh operator over a fresh TestTokenV2 instrument X, in
+-- the given mode and offset, with `n` requesters and a sponsor holding
+-- `funds` X each.
+setupWorldWith : Text -> Mode -> Int -> Int -> Decimal -> Script World
+setupWorldWith tag mode k n funds = do
+  underlying <- setupUnderlying ("underlying-" <> tag)
+  shares <- S.setupRegistry tag
+  requesters <- forA [1 .. n] (\i -> allocateParty ("requester-" <> show i <> "-" <> tag))
+  sponsor <- allocateParty ("sponsor-" <> tag)
+  forA_ (sponsor :: requesters) (\p -> mintUnderlying underlying p funds)
+  let operator = shares.operator
+      vaultId = shares.instrument.id
+  _ <- submit operator $ createCmd (initialState underlying shares mode k)
+  pure World with underlying; shares; operator; vaultId; requesters; sponsor; mode; k
+
+setupWorld : Text -> Mode -> Int -> Int -> Script World
+setupWorld tag mode k n = setupWorldWith tag mode k n 1000.0
+
+-- | The state of a new vault (`docs/SPEC.md` §5.1).
+initialState : Underlying -> S.Registry -> Mode -> Int -> VaultState
+initialState underlying shares mode k = VaultState with
+  operator = shares.operator
+  vaultId = shares.instrument.id
+  asset = underlyingInstrument underlying
+  shareInstrument = shares.instrument
+  vaultAccount = basicAccount shares.operator
+  mode
+  assetRegistry = RegistryRef with
+    allocationFactory = toInterfaceContractId underlying.rules
+    settlementFactory = toInterfaceContractId underlying.rules
+  shareRegistry = RegistryRef with
+    allocationFactory = toInterfaceContractId shares.rules
+    settlementFactory = toInterfaceContractId shares.rules
+  decimalsOffset = k
+  totalAssets = 0.0
+  totalShares = 0.0
+  paused = False
+  meta = emptyMetadata
+
+-- | The vault's current state.
+vaultOf : World -> Script (ContractId VaultState, VaultState)
+vaultOf w = do
+  vs <- query @VaultState w.operator
+  case [ x | x@(_, v) <- vs, v.vaultId == w.vaultId ] of
+    [x] -> pure x
+    other -> abort ("expected one vault state, found " <> show (length other))
+
+-- | `(A, S)`.
+totalsOf : World -> Script (Decimal, Decimal)
+totalsOf w = do
+  (_, v) <- vaultOf w
+  pure (v.totalAssets, v.totalShares)
+
+-- | A requester's underlying and shares, each as (unlocked, locked).
+positionOf : World -> Party -> Script ((Decimal, Decimal), (Decimal, Decimal))
+positionOf w p = do
+  x <- underlyingBalance w.underlying p
+  y <- S.balanceOf w.shares p
+  pure (x, y)
+
+-- Submissions
+--------------
+
+-- | A submission, to try or to run for its transaction tree.
+data Submission a = Submission with
+    submitter : Party
+    disclosures : [Disclosure]
+    commands : Commands a
+
+attempt : Submission a -> Script (Either SubmitError a)
+attempt s = trySubmit (actAs s.submitter <> discloseMany s.disclosures) s.commands
+
+-- | Build a submission and try it.
+tryS : Script (Submission a) -> Script (Either SubmitError a)
+tryS build = build >>= attempt
+
+run : Submission a -> Script a
+run s = attempt s >>= either (\e -> abort ("submission failed: " <> show e)) pure
+
+runTree : Submission a -> Script TransactionTree
+runTree s = submitTree (actAs s.submitter <> discloseMany s.disclosures) s.commands
+
+-- | What a submitter that is not the operator needs from the operator: the
+-- current vault state and the share registry's rules (`docs/SPEC.md` §2).
+operatorDisclosures : World -> Party -> Script [Disclosure]
+operatorDisclosures w executor
+  | executor == w.operator = pure []
+  | otherwise = do
+      (cid, _) <- vaultOf w
+      vd <- fromSome <$> queryDisclosure w.operator cid
+      sd <- S.rulesDisclosure w.shares
+      pure [vd, sd]
+
+-- Requests
+-----------
+
+-- | A request and, when funded, its input allocation.
+type Funded r = (ContractId r, Optional (ContractId V2.Allocation))
+
+-- | A deposit request of `p` with a deadline one day ahead.
+newDeposit : World -> Party -> Decimal -> Decimal -> Bool -> Script (Funded DepositRequest)
+newDeposit w p amount minOut funded = do
+  now <- getTime
+  newDepositUntil w p amount minOut funded (addRelTime now (days 1))
+
+newDepositUntil : World -> Party -> Decimal -> Decimal -> Bool -> Time -> Script (Funded DepositRequest)
+newDepositUntil w p amount minOut funded deadline = do
+  req <- submit p $ createCmd DepositRequest with
+    requester = p; operator = w.operator; vaultId = w.vaultId
+    payAccount = basicAccount p; receiver = basicAccount p
+    amount; minOut; deadline; funded; meta = emptyMetadata
+  if not funded then pure (req, None) else do
+    alloc <- fundDeposit w p req amount deadline
+    pure (req, Some alloc)
+
+-- | The requester's committed input allocation of a deposit, at TestTokenV2
+-- (`docs/SPEC.md` §5.2).
+fundDeposit : World -> Party -> ContractId DepositRequest -> Decimal -> Time -> Script (ContractId V2.Allocation)
+fundDeposit w p req amount deadline = do
+  (_, v) <- vaultOf w
+  now <- getTime
+  inputs <- underlyingHoldings w.underlying p
+  d <- underlyingDisclosure w.underlying
+  let settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId req)
+      leg = inLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount p) amount
+  res <- submit (actAs p <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2.AllocationFactory w.underlying.rules) V2.AllocationFactory_Allocate with
+      settlement
+      allocation = allocationSpec w.underlying.admin (basicAccount p) (senderSide leg) (Some deadline) True
+      requestedAt = now; inputHoldingCids = inputs; extraArgs = underlyingArgs w.underlying; actors = [p]
+  completed res
+
+-- | A redemption request of `p` with a deadline one day ahead.
+newRedeem : World -> Party -> Decimal -> Decimal -> Bool -> Script (Funded RedeemRequest)
+newRedeem w p amount minOut funded = do
+  now <- getTime
+  newRedeemUntil w p amount minOut funded (addRelTime now (days 1))
+
+newRedeemUntil : World -> Party -> Decimal -> Decimal -> Bool -> Time -> Script (Funded RedeemRequest)
+newRedeemUntil w p amount minOut funded deadline = do
+  req <- submit p $ createCmd RedeemRequest with
+    requester = p; operator = w.operator; vaultId = w.vaultId
+    payAccount = basicAccount p; receiver = basicAccount p
+    amount; minOut; deadline; funded; meta = emptyMetadata
+  if not funded then pure (req, None) else do
+    (_, v) <- vaultOf w
+    inputs <- shareInputs w p
+    let settlement = requestSettlement w.operator w.vaultId Redeem (coerceContractId req)
+        leg = inLeg Redeem v.vaultAccount v.asset v.shareInstrument (basicAccount p) amount
+    (alloc, _) <- S.allocate w.shares [p] settlement
+      (allocationSpec w.operator (basicAccount p) (senderSide leg) (Some deadline) True) inputs
+    pure (req, Some alloc)
+
+-- | A requester's unlocked share holdings.
+shareInputs : World -> Party -> Script [ContractId V2.Holding]
+shareInputs w p = do
+  hs <- S.holdingsOf w.shares p
+  pure [ toInterfaceContractId cid | (cid, h) <- hs, isNone h.lock ]
+
+-- Executions
+-------------
+
+depositItem : World -> Party -> Funded DepositRequest -> Script DepositItem
+depositItem w p (request, fundingAllocation) = do
+  fundingInputs <- if isSome fundingAllocation then pure [] else underlyingHoldings w.underlying p
+  pure DepositItem with request; fundingAllocation; fundingInputs
+
+redeemItem : World -> Party -> Funded RedeemRequest -> Script RedeemItem
+redeemItem w p (request, fundingAllocation) = do
+  fundingInputs <- if isSome fundingAllocation then pure [] else shareInputs w p
+  vaultInputs <- underlyingHoldings w.underlying w.operator
+  pure RedeemItem with request; fundingAllocation; fundingInputs; vaultInputs
+
+-- | `Vault_ExecuteDeposits` by `executor`, with every disclosure it needs.
+executeDeposits : World -> Party -> [(Party, DepositItem)] -> Script (Submission ExecResult)
+executeDeposits w executor items = do
+  (cid, _) <- vaultOf w
+  ud <- underlyingDisclosure w.underlying
+  od <- operatorDisclosures w executor
+  -- A contract is disclosed once, even when a batch lists a request twice:
+  -- the protocol version 34 participant rejects a submission whose
+  -- disclosed contracts repeat a contract ID.
+  inputs <- forA (dedup [ (p, h) | (p, i) <- items, h <- i.fundingInputs ]) $ \(p, h) ->
+    head <$> tokenDisclosures p [h]
+  locked <- lockedDisclosures w.underlying (dedup [ a | (_, i) <- items, Some a <- [i.fundingAllocation] ])
+  pure Submission with
+    submitter = executor
+    disclosures = ud :: od ++ inputs ++ locked
+    commands = exerciseCmd cid Vault_ExecuteDeposits with
+      executor; items = map snd items; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+
+-- | `Vault_ExecuteRedeems` by `executor`, with every disclosure it needs.
+executeRedeems : World -> Party -> [(Party, RedeemItem)] -> Script (Submission ExecResult)
+executeRedeems w executor items = do
+  (cid, _) <- vaultOf w
+  ud <- underlyingDisclosure w.underlying
+  od <- operatorDisclosures w executor
+  vaultHoldings <- if executor == w.operator then pure [] else
+    tokenDisclosures w.operator (dedup (concatMap (\(_, i) -> i.vaultInputs) items))
+  pure Submission with
+    submitter = executor
+    disclosures = ud :: od ++ vaultHoldings
+    commands = exerciseCmd cid Vault_ExecuteRedeems with
+      executor; items = map snd items; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+
+-- | Deposit for each requester in one batch: create, item, execute.
+depositAll : World -> Party -> [(Party, Decimal, Bool)] -> Script (Submission ExecResult)
+depositAll w executor asks = do
+  items <- forA asks $ \(p, amount, funded) -> do
+    r <- newDeposit w p amount 0.0 funded
+    i <- depositItem w p r
+    pure (p, i)
+  executeDeposits w executor items
+
+redeemAll : World -> Party -> [(Party, Decimal, Bool)] -> Script (Submission ExecResult)
+redeemAll w executor asks = do
+  items <- forA asks $ \(p, amount, funded) -> do
+    r <- newRedeem w p amount 0.0 funded
+    i <- redeemItem w p r
+    pure (p, i)
+  executeRedeems w executor items
+
+-- Asset additions, pause, cancellation
+---------------------------------------
+
+-- | The sponsor's allocation into the vault account for `amount`, bound to
+-- the current vault state, and `Vault_AddAssets`.
+addAssets : World -> Decimal -> Script (Submission (ContractId VaultState))
+addAssets w amount = do
+  (cid, v) <- vaultOf w
+  now <- getTime
+  inputs <- underlyingHoldings w.underlying w.sponsor
+  d <- underlyingDisclosure w.underlying
+  let source = basicAccount w.sponsor
+      settlement = V2.SettlementInfo with
+        executors = [w.operator]; id = w.vaultId <> "/add-assets"; cid = Some (coerceContractId cid); meta = emptyMetadata
+      leg = V2.TransferLeg with
+        transferLegId = "add"; sender = source; receiver = v.vaultAccount; amount
+        instrumentId = v.asset.id; meta = emptyMetadata
+  res <- submit (actAs w.sponsor <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2.AllocationFactory w.underlying.rules) V2.AllocationFactory_Allocate with
+      settlement
+      allocation = allocationSpec w.underlying.admin source (senderSide leg) None False
+      requestedAt = now; inputHoldingCids = inputs; extraArgs = underlyingArgs w.underlying; actors = [w.sponsor]
+  funding <- completed res
+  locked <- lockedDisclosures w.underlying [funding]
+  pure Submission with
+    submitter = w.operator
+    disclosures = d :: locked
+    commands = exerciseCmd cid Vault_AddAssets with
+      amount; source; funding; assetContext = underlyingArgs w.underlying
+
+pause : World -> Script (Submission (ContractId VaultState))
+pause w = do
+  (cid, _) <- vaultOf w
+  pure Submission with submitter = w.operator; disclosures = []; commands = exerciseCmd cid Vault_Pause
+
+unpause : World -> Script (Submission (ContractId VaultState))
+unpause w = do
+  (cid, _) <- vaultOf w
+  pure Submission with submitter = w.operator; disclosures = []; commands = exerciseCmd cid Vault_Unpause
+
+-- | `DepositRequest_Cancel` with the given allocations.
+cancelDeposit : World -> Party -> ContractId DepositRequest -> [ContractId V2.Allocation] -> Script (Submission ())
+cancelDeposit w p req allocations = do
+  d <- underlyingDisclosure w.underlying
+  pure Submission with
+    submitter = p; disclosures = [d]
+    commands = exerciseCmd req DepositRequest_Cancel with allocations; extraArgs = underlyingArgs w.underlying
+
+cancelRedeem : World -> Party -> ContractId RedeemRequest -> [ContractId V2.Allocation] -> Script (Submission ())
+cancelRedeem w p req allocations =
+  pure Submission with
+    submitter = p; disclosures = []
+    commands = exerciseCmd req RedeemRequest_Cancel with allocations; extraArgs = S.noArgs
+
+-- Reconciliation (I-01, I-02)
+------------------------------
+
+-- | The underlying that a vault choice moved into the vault account, minus
+-- what it moved out, read from its transaction tree: holdings of the vault
+-- account created minus those archived. Amounts of holdings that existed
+-- before are taken from `before`.
+vaultAccountFlow : World -> Map.Map (ContractId V2.Holding) Decimal -> TransactionTree -> Decimal
+vaultAccountFlow w before tree =
+  let account = basicAccount w.operator
+      events = S.flatten tree.rootEvents
+      created = [ (toInterfaceContractId @V2.Holding (fromSome (fromAnyContractId @Token c.contractId)), t.holding.amount)
+                | CreatedEvent c <- events, Some t <- [fromAnyTemplate @Token c.argument]
+                , t.holding.account == account, t.holding.instrumentId == underlyingInstrument w.underlying ]
+      known = Map.union (Map.fromList created) before
+      archived = [ toInterfaceContractId @V2.Holding (fromSome (fromAnyContractId @Token e.contractId))
+                 | ExercisedEvent e <- events, e.choice == "Archive", isSome (fromAnyContractId @Token e.contractId) ]
+      amountOf cid = fromOptional 0.0 (Map.lookup cid known)
+  in sum (map snd created) - sum [ amountOf cid | cid <- archived, Map.member cid known ]
+
+-- | Run a vault choice and return its contribution to the I-01 journal.
+journaled : World -> Submission a -> Script Decimal
+journaled w s = do
+  before <- accountHoldings w.underlying (basicAccount w.operator)
+  tree <- runTree s
+  pure (vaultAccountFlow w (Map.fromList before) tree)
+
+-- | The four totals that the reconciliation compares.
+data Reconciliation = Reconciliation with
+    recordedAssets : Decimal
+      -- ^ `A` in the vault state.
+    journalAssets : Decimal
+      -- ^ Underlying moved into the vault account by vault choices, minus out (I-01).
+    recordedShares : Decimal
+      -- ^ `S` in the vault state.
+    shareSupply : Decimal
+      -- ^ The sum of every share holding (I-02).
+    custody : Decimal
+      -- ^ The underlying the vault account holds: the journal plus what
+      -- entered outside vault choices (donations), minus what left outside
+      -- them (T-10).
+  deriving (Eq, Show)
+
+-- | Read the four totals.
+reconcile : World -> Decimal -> Script Reconciliation
+reconcile w journal = do
+  (_, v) <- vaultOf w
+  holdings <- query @ShareHolding w.operator
+  held <- accountHoldings w.underlying (basicAccount w.operator)
+  let supply = sum [ h.amount | (_, h) <- holdings, h.instrumentId == v.shareInstrument ]
+  pure Reconciliation with
+    recordedAssets = v.totalAssets; journalAssets = journal
+    recordedShares = v.totalShares; shareSupply = supply
+    custody = sum (map snd held)
+
+-- | Whether the vault state reconciles: I-01 and I-02 hold, and the vault
+-- account holds at least `A`. A movement out of the vault account outside
+-- vault choices smaller than the donations it has received passes the last
+-- check; the registry's events for the vault account show it (`docs/SPEC.md`
+-- §8).
+reconciles : Reconciliation -> Bool
+reconciles r = r.recordedAssets == r.journalAssets && r.recordedShares == r.shareSupply
+  && r.custody >= r.recordedAssets
+
+-- | The default validity of a request.
+oneDay : RelTime
+oneDay = days 1

@@ -1,0 +1,57 @@
+-- | Measured batches: `size` deposits from `size`
+-- requesters, executed by the operator in Permissioned mode, then the
+-- redemption of every requester's shares in one batch, each paid from the
+-- vault-account holding that its deposit created. Every second request is
+-- funded. Returns, per batch, the number of transaction nodes, of contracts
+-- created, of exercises, of holdings-change events and of share event logs.
+-- Run on a sandbox through `dpm script`, with the times read from the
+-- participant's log. Not a test: it takes an input.
+module Cayvox.VaultV1Test.Measure
+  ( MeasureInput (..)
+  , measureBatch
+  ) where
+
+import DA.Optional (isSome)
+import qualified DA.Text as T
+import Daml.Script
+
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Internal.ShareRegistry (ShareEventLog)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+-- | The batch size and a tag that makes the run's party names unique.
+data MeasureInput = MeasureInput with
+    size : Int
+    tag : Text
+  deriving (Eq, Show)
+
+measureBatch : MeasureInput -> Script Text
+measureBatch input = do
+  let n = input.size
+  w <- setupWorldWith ("r27-" <> input.tag <> "-" <> show n) Permissioned 0 n 100.0
+  deposits <- forA (zip [1 .. n] w.requesters) $ \(i, p) -> do
+    r <- newDeposit w p 10.0 0.0 (i % 2 == 0)
+    item <- depositItem w p r
+    pure (p, item)
+  dtree <- runTree =<< executeDeposits w w.operator deposits
+  held <- underlyingHoldings w.underlying w.operator
+  redemptions <- forA (zip3 [1 .. n] w.requesters held) $ \(i, p, h) -> do
+    (request, fundingAllocation) <- newRedeem w p 10.0 0.0 (i % 2 == 0)
+    fundingInputs <- if isSome fundingAllocation then pure [] else shareInputs w p
+    pure (p, RedeemItem with request; fundingAllocation; fundingInputs; vaultInputs = [h])
+  rtree <- runTree =<< executeRedeems w w.operator redemptions
+  pure $ T.intercalate " " ["size=" <> show n, counts "deposits" dtree, counts "redemptions" rtree]
+
+-- | Nodes, creates, exercises and holdings-change events of a transaction.
+counts : Text -> TransactionTree -> Text
+counts label tree =
+  let events = S.flatten tree.rootEvents
+      created = [ c | CreatedEvent c <- events ]
+      exercised = [ e | ExercisedEvent e <- events ]
+      shareLogs = length [ () | c <- created, Some _ <- [fromAnyTemplate @ShareEventLog c.argument] ]
+      changes = length [ () | e <- exercised, e.choice == "EventLog_HoldingsChange" ]
+  in T.intercalate "," [ label <> ":nodes=" <> show (length events), "created=" <> show (length created)
+                       , "exercised=" <> show (length exercised)
+                       , "holdingsChanges=" <> show changes, "shareEventLogs=" <> show shareLogs ]

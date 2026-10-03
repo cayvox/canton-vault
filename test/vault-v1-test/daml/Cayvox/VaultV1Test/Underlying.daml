@@ -1,0 +1,106 @@
+-- | The underlying registry of the vault tests: Splice 0.8.4 TestTokenV2
+-- (`dars/vendor/splice-test-token-v2-1.0.1.dar`), with its choice context, minting, holdings and disclosures.
+module Cayvox.VaultV1Test.Underlying where
+
+import DA.Optional (catOptionals, fromSome, isNone, isSome)
+import qualified DA.TextMap as TextMap
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.AllocationInstructionV2 as V2
+import qualified Splice.Api.Token.AllocationV2 as V2
+import qualified Splice.Api.Token.HoldingV2 as V2
+import qualified Splice.Api.Token.TransferInstructionV2 as V2
+import Splice.Testing.Tokens.TestTokenV2
+  ( AccountConfig (..), PartyConfig (..), Token (..), TokenRules (..)
+  , TokenRules_OfferMint (..), accountConfigsContextKey )
+import Splice.Testing.Tokens.TestTokenV2.Util (tokenRulesContextKey)
+
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount)
+
+-- | A TestTokenV2 registry.
+data Underlying = Underlying with
+    admin : Party
+    rules : ContractId TokenRules
+
+setupUnderlying : Text -> Script Underlying
+setupUnderlying name = do
+  admin <- allocateParty name
+  rules <- submit admin $ createCmd TokenRules with admin
+  pure Underlying with admin; rules
+
+-- | The choice context TestTokenV2 expects (Splice 0.8.4
+-- `TestTokenV2_RegistryV2.daml:342-354`).
+underlyingArgs : Underlying -> ExtraArgs
+underlyingArgs u = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (accountConfigsContextKey, AV_List [])
+      , (tokenRulesContextKey, AV_ContractId (coerceContractId u.rules)) ]
+  meta = emptyMetadata
+
+underlyingDisclosure : Underlying -> Script Disclosure
+underlyingDisclosure u = fromSome <$> queryDisclosure @TokenRules u.admin u.rules
+
+underlyingInstrument : Underlying -> V2.InstrumentId
+underlyingInstrument u = V2.InstrumentId with admin = u.admin; id = "X"
+
+-- | Mint underlying to an account through TestTokenV2's offer and accept.
+mintUnderlyingTo : Underlying -> Party -> V2.Account -> Decimal -> Script ()
+mintUnderlyingTo u owner account amount = do
+  now <- getTime
+  res <- submit u.admin $ exerciseCmd u.rules TokenRules_OfferMint with
+    receiver = account; amount; instrumentId = underlyingInstrument u; offeredAt = now
+    receiverConfig = AccountConfig with
+      admin = u.admin; account; ownerConfig = PartyConfig True True; providerConfig = PartyConfig False False
+  d <- underlyingDisclosure u
+  _ <- submit (actAs owner <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2.TransferInstruction res.offerCid) V2.TransferInstruction_Accept with
+      actors = [owner]; extraArgs = underlyingArgs u
+  pure ()
+
+-- | Mint underlying to an owner's basic account.
+mintUnderlying : Underlying -> Party -> Decimal -> Script ()
+mintUnderlying u owner = mintUnderlyingTo u owner (basicAccount owner)
+
+-- | Unlocked underlying holdings of an owner's basic account.
+underlyingHoldings : Underlying -> Party -> Script [ContractId V2.Holding]
+underlyingHoldings u owner = do
+  hs <- queryInterface @V2.Holding owner
+  pure [ cid | (cid, Some v) <- hs, v.instrumentId == underlyingInstrument u, v.account == basicAccount owner, isNone v.lock ]
+
+-- | Unlocked and locked underlying of an owner's basic account, read by the admin.
+underlyingBalance : Underlying -> Party -> Script (Decimal, Decimal)
+underlyingBalance u owner = do
+  hs <- queryInterface @V2.Holding u.admin
+  let vs = [ v | (_, Some v) <- hs, v.instrumentId == underlyingInstrument u, v.account == basicAccount owner ]
+  pure (sum [ v.amount | v <- vs, isNone v.lock ], sum [ v.amount | v <- vs, isSome v.lock ])
+
+-- | Every underlying holding of an account, with its amount, read by the admin.
+accountHoldings : Underlying -> V2.Account -> Script [(ContractId V2.Holding, Decimal)]
+accountHoldings u account = do
+  hs <- queryInterface @V2.Holding u.admin
+  pure [ (cid, v.amount) | (cid, Some v) <- hs, v.instrumentId == underlyingInstrument u, v.account == account ]
+
+-- | Disclosures of holdings, read by their owner.
+tokenDisclosures : Party -> [ContractId V2.Holding] -> Script [Disclosure]
+tokenDisclosures owner cids = forA cids $ \h -> fromSome <$> queryDisclosure @Token owner (coerceContractId h)
+
+-- | Disclosures of the underlying holdings locked by allocations, read by
+-- the admin; allocations of the share registry need none, because the
+-- operator observes their locked holdings. A holding no longer active is
+-- skipped.
+lockedDisclosures : Underlying -> [ContractId V2.Allocation] -> Script [Disclosure]
+lockedDisclosures u cids = fmap concat $ forA cids $ \cid -> do
+  found <- queryInterfaceContractId @V2.Allocation u.admin cid
+  case found of
+    None -> pure []
+    Some v -> do
+      found <- forA v.holdingCids $ \h -> queryDisclosure @Token u.admin (coerceContractId h)
+      pure (catOptionals found)
+
+-- | The allocation of a completed allocation result.
+completed : V2.AllocationInstructionResult -> Script (ContractId V2.Allocation)
+completed res = case res.output of
+  V2.AllocationInstructionResult_Completed {allocationCid} -> pure allocationCid
+  other -> abort ("allocation not completed: " <> show other)

@@ -1,0 +1,20 @@
+# Findings of OpenZeppelin daml-lint that are justified rather than fixed
+# (gate Q-10, docs/TESTING.md). scripts/check-daml-lint.sh fails on any finding
+# no row matches and on any row that matches no finding.
+# Columns, tab-separated: detector, file (repository-relative), a Python
+# regular expression searched in the finding's evidence, justification.
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	^addCarry .*\(s / base\)$	The denominator is `base`, the constant 10^9.
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	^mulCarry m \(x :: xs\) c = .*\(p / base\)$	The denominator is `base`, the constant 10^9.
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	^\(rest, c, b\) = mulSubGo q ws vs' \(p / base\) borrow'$	The denominator is `base`, the constant 10^9.
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	^in \(s % base\) :: addBackGo ws vs' \(s / base\)$	The denominator is `base`, the constant 10^9.
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	^divStep v x \(acc, r\) = let cur = r \* base \+ x in \(\(cur / v\)	`divSmall` is called with the only limb of a normalized, non-empty divisor, which is non-zero (`divModLimbs`), and with the D1 factor `d >= 1` (`algorithmD`).
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	^d = base / \(last v \+ 1\)	The denominator is a limb plus one, at least 1.
+unguarded-division	packages/utils/vault-math-v1/daml/Cayvox/VaultMathV1/Internal.daml	\(num / vTop\)	`vTop` is the top limb of the divisor after D1 normalization, at least base / 2 (`ARCHITECTURE.md` of the package, section 3).
+unguarded-division	test/vault-math-v1-test/daml/Cayvox/VaultMathV1Test/EdgeVectors.daml	^[\[,] EdgeVector with label = "	The " / " is inside a label string literal of test data produced by the oracle; the module performs no division.
+head-of-list-query	test/vault-v1-test/daml/Cayvox/VaultV1Test/EventsAndThreats.daml	^\[\(i, _\)\] <- queryInterface @TransferInstruction alice$	Test code. Alice has exactly one pending instruction at this point, and a pattern failure fails the test, which is the intended assertion.
+missing-positive-amount	test/vault-v1-test/daml/Cayvox/VaultV1Test/Conversion.daml	^amount : Decimal	Test harness. `Convert` passes zero and negative amounts to the conversion functions on purpose, to assert their failures (`test_conversion_rejectsNegativeAmount`).
+missing-ensure-decimal	packages/token/vault-v1/daml/Cayvox/VaultV1.daml	^total(Assets|Shares) : Decimal	Bounded in the `ensure` by `validState`: `A` and `S` not negative and within the asset and share bounds of `docs/MATH.md` §7. Zero is a valid state: a new vault has `A = S = 0` (`docs/SPEC.md` §5.1).
+missing-ensure-decimal	packages/token/vault-v1/daml/Cayvox/VaultV1.daml	^(amount|minOut) : Decimal	Checked in the `ensure` by `requestValid`: `amount > 0` and `minOut >= 0`, failing with `vault-invalid-amount` (`docs/SPEC.md` §4.2, §7). `minOut = 0` is valid.
+missing-positive-amount	packages/token/vault-v1/daml/Cayvox/VaultV1.daml	fundingInputs	Empty by design for a funded request, whose input is its funding allocation; for an unfunded request the registry refuses inputs that do not cover the amount.
+unguarded-division	test/vault-v1-test/daml/Cayvox/VaultV1Test/Sequences.daml	/ [1-9][0-9]*\b	Test generator. Each denominator is a positive integer literal: `Int` divisions that pick bits of the seeded generator to choose operations, amounts and sequence settings; no amount, share or price is divided.
+missing-positive-amount	test/vault-v1-test/daml/Cayvox/VaultV1Test/R30.daml	null inputs	Test of the chained change, not production code. The first allocation of the chain spends `inputs`; TestTokenV2 refuses an allocation whose inputs do not cover its amount, so an empty list fails the probe, which reports it.

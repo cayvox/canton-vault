@@ -1,0 +1,144 @@
+-- | Share registry tests: every bounded field at its bound and one above
+-- (`docs/SECURITY.md`, T-16; `docs/REGISTRY-MUSTS.md`, RM-55, RM-56).
+module Cayvox.VaultV1Test.Bounds where
+
+import qualified DA.Text as T
+import qualified DA.TextMap as TextMap
+import DA.Time (addRelTime, seconds)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard
+import Cayvox.VaultV1Test.Setup
+
+-- | A text of the given length.
+textOf : Int -> Text
+textOf n = T.implode (replicate n "a")
+
+-- | Metadata with `n` entries, keys of `k` and values of `v` characters.
+metaOf : Int -> Int -> Int -> Metadata
+metaOf n k v = Metadata with
+  values = TextMap.fromList [ (T.take k (show i <> textOf k), textOf v) | i <- [1 .. n] ]
+
+-- | The metadata bounds, at each bound and one above.
+test_bounds_meta : Script ()
+test_bounds_meta = do
+  check "16 entries" (boundedMeta (metaOf 16 5 5))
+  check "17 entries" (not (boundedMeta (metaOf 17 5 5)))
+  check "key of 256" (boundedMeta (metaOf 1 256 5))
+  check "key of 257" (not (boundedMeta (metaOf 1 257 5)))
+  check "value of 1024" (boundedMeta (metaOf 1 5 1024))
+  check "value of 1025" (not (boundedMeta (metaOf 1 5 1025)))
+  check "text of 256" (boundedText (textOf 256))
+  check "text of 257" (not (boundedText (textOf 257)))
+
+-- | `ShareRules`: the instrument identifier and the metadata.
+test_bounds_rulesFields : Script ()
+test_bounds_rulesFields = do
+  operator <- allocateParty "operator-bounds-rules"
+  let rules id m = ShareRules with admin = operator; instrumentId = (InstrumentId with admin = operator; id); meta = m
+  _ <- submit operator $ createCmd (rules (textOf 256) (metaOf 16 5 5))
+  trySubmit operator (createCmd (rules (textOf 257) emptyMetadata)) >>= assertFails PreconditionViolated
+  trySubmit operator (createCmd (rules "v" (metaOf 17 5 5))) >>= assertFails PreconditionViolated
+  pure ()
+
+-- | `ShareHolding`: the account identifier, the lock context and holders,
+-- the lock observers and the metadata.
+test_bounds_holdingFields : Script ()
+test_bounds_holdingFields = do
+  reg <- setupRegistry "bounds-holding"
+  alice <- allocateParty "alice-bounds-holding"
+  observers <- forA [1 .. 13] (\i -> allocateParty ("observer-bounds-" <> show i))
+  let lockWith holders context = Lock with holders; expiresAt = None; expiresAfter = None; context
+      holding accountId l obs m = ShareHolding with
+        admin = reg.operator; instrumentId = reg.instrument
+        account = Account with owner = Some alice; provider = None; id = accountId
+        amount = 1.0; lock = l; lockObservers = obs; meta = m
+      create_ h = trySubmit (actAs [reg.operator, alice]) (createCmd h)
+      ok h = create_ h >>= either (abort . show) (const (pure ()))
+  ok (holding (textOf 256) None [] emptyMetadata)
+  create_ (holding (textOf 257) None [] emptyMetadata) >>= assertFails PreconditionViolated
+  ok (holding "" (Some (lockWith [reg.operator] (Some (textOf 256)))) (take 12 observers) (metaOf 16 5 5))
+  create_ (holding "" (Some (lockWith [reg.operator] (Some (textOf 257)))) [] emptyMetadata) >>= assertFails PreconditionViolated
+  create_ (holding "" (Some (lockWith [reg.operator, reg.operator] None)) [] emptyMetadata) >>= assertFails PreconditionViolated
+  create_ (holding "" (Some (lockWith [] None)) [] emptyMetadata) >>= assertFails PreconditionViolated
+  create_ (holding "" (Some (lockWith [reg.operator] None)) observers emptyMetadata) >>= assertFails PreconditionViolated
+  create_ (holding "" None [alice] emptyMetadata) >>= assertFails PreconditionViolated
+  create_ (holding "" None [] (metaOf 17 5 5)) >>= assertFails PreconditionViolated
+
+-- | `ShareEventLog`: the account identifier.
+test_bounds_eventLogFields : Script ()
+test_bounds_eventLogFields = do
+  reg <- setupRegistry "bounds-log"
+  alice <- allocateParty "alice-bounds-log"
+  let acct id = Account with owner = Some alice; provider = None; id
+  _ <- submit (actAs [reg.operator, alice]) $ createCmd ShareEventLog with admin = reg.operator; account = acct (textOf 256)
+  trySubmit (actAs [reg.operator, alice]) (createCmd ShareEventLog with admin = reg.operator; account = acct (textOf 257))
+    >>= assertFails PreconditionViolated
+
+-- | Allocation arguments that become contract fields are checked before the
+-- allocation is created: the settlement identifier, executors and metadata,
+-- the allocation metadata, the authorizer's account identifier, and each leg
+-- side's identifier and metadata.
+test_bounds_allocationFields : Script ()
+test_bounds_allocationFields = do
+  reg <- setupRegistry "bounds-alloc"
+  alice <- allocateParty "alice-bounds-alloc"
+  bob <- allocateParty "bob-bounds-alloc"
+  executors <- forA [1 .. 11] (\i -> allocateParty ("executor-bounds-" <> show i))
+  let recvAcct id = Account with owner = Some alice; provider = None; id
+      leg id = shareLeg reg id (basicAccount bob) (recvAcct "") 1.0
+      spec legSide = specOf reg (recvAcct "") [receiverSide legSide] None False
+      s = settlementOf reg "s"
+      ok settlement allocation = allocate reg [alice] settlement allocation [] >> pure ()
+      tooLarge settlement allocation = tryAllocate reg [alice] settlement allocation [] >>= assertFails (registry "field-too-large")
+  ok (s with id = textOf 256) (spec (leg "l"))
+  tooLarge (s with id = textOf 257) (spec (leg "l"))
+  ok (s with executors = take 10 executors) (spec (leg "l"))
+  tooLarge (s with executors = executors) (spec (leg "l"))
+  tooLarge (s with executors = []) (spec (leg "l"))
+  ok (s with meta = metaOf 16 5 5) (spec (leg "l"))
+  tooLarge (s with meta = metaOf 17 5 5) (spec (leg "l"))
+  ok s ((spec (leg "l")) with meta = metaOf 16 5 5)
+  tooLarge s ((spec (leg "l")) with meta = metaOf 17 5 5)
+  ok s (spec (leg (textOf 256)))
+  tooLarge s (spec (leg (textOf 257)))
+  ok s (spec ((leg "l") with meta = metaOf 16 5 5))
+  tooLarge s (spec ((leg "l") with meta = metaOf 17 5 5))
+  let longLeg = shareLeg reg "l" (basicAccount bob) (recvAcct (textOf 256)) 1.0
+      tooLongLeg = shareLeg reg "l" (basicAccount bob) (recvAcct (textOf 257)) 1.0
+  ok s (specOf reg (recvAcct (textOf 256)) [receiverSide longLeg] None False)
+  tooLarge s (specOf reg (recvAcct (textOf 257)) [receiverSide tooLongLeg] None False)
+
+-- | Transfer arguments: the account identifiers, the metadata and the
+-- number of input holdings.
+test_bounds_transferFields : Script ()
+test_bounds_transferFields = do
+  reg <- setupRegistry "bounds-transfer"
+  alice <- allocateParty "alice-bounds-transfer"
+  bob <- allocateParty "bob-bounds-transfer"
+  h <- mintShares reg alice 10.0 "bounds-transfer"
+  now <- getTime
+  let base = Transfer with
+        sender = basicAccount alice; receiver = basicAccount bob; amount = 1.0
+        instrumentId = reg.instrument; requestedAt = now; executeBefore = addRelTime now (seconds 60)
+        inputHoldingCids = [h]; meta = emptyMetadata
+  check "50 inputs" (boundedTransfer (base with inputHoldingCids = replicate 50 h))
+  check "51 inputs" (not (boundedTransfer (base with inputHoldingCids = replicate 51 h)))
+  check "metadata of 16" (boundedTransfer (base with meta = metaOf 16 5 5))
+  check "metadata of 17" (not (boundedTransfer (base with meta = metaOf 17 5 5)))
+  d <- rulesDisclosure reg
+  let attempt t = trySubmit (actAs [alice, bob] <> disclose d) $
+        exerciseCmd (toInterfaceContractId @TransferFactory reg.rules) TransferFactory_Transfer with
+          transfer = t; actors = [alice, bob]; extraArgs = noArgs
+  attempt (base with inputHoldingCids = replicate 51 h) >>= assertFails (registry "field-too-large")
+  attempt (base with meta = metaOf 17 5 5) >>= assertFails (registry "field-too-large")
+  attempt (base with receiver = (Account with owner = Some bob; provider = None; id = textOf 257))
+    >>= assertFails (registry "field-too-large")
+  res <- attempt (base with meta = metaOf 16 5 5; receiver = (Account with owner = Some bob; provider = None; id = textOf 256))
+  either (abort . show) (const (pure ())) res

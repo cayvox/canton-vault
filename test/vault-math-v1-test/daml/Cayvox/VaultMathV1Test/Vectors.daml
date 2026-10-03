@@ -1,0 +1,28 @@
+-- | Runs `mulDiv` on vectors given as JSON (`dpm script --input-file`) for
+-- the differential oracle, `scripts/math-oracle.py`.
+module Cayvox.VaultMathV1Test.Vectors
+  ( Vector (..)
+  , runVectors
+  ) where
+
+import DA.Optional (fromSomeNote)
+import qualified DA.Text as T
+import Daml.Script
+
+import Cayvox.VaultMathV1
+
+-- | Operands as `Decimal` text.
+data Vector = Vector with
+    a : Text
+    b : Text
+    c : Text
+  deriving (Eq, Show)
+
+-- | "floor|ceil" per vector, computed through the public `mulDiv` and caught
+-- with `tryFailureStatus`.
+runVectors : [Vector] -> Script [Text]
+runVectors = mapA $ \v -> do
+  let dec t = fromSomeNote ("not a Decimal: " <> t) (T.parseDecimal t)
+  f <- tryFailureStatus (let x = mulDiv Floor (dec v.a) (dec v.b) (dec v.c) in pure x)
+  c <- tryFailureStatus (let x = mulDiv Ceil (dec v.a) (dec v.b) (dec v.c) in pure x)
+  pure (either (.errorId) show f <> "|" <> either (.errorId) show c)

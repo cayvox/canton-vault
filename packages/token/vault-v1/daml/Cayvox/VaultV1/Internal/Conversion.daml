@@ -1,0 +1,75 @@
+-- | The terms and checks behind `Cayvox.VaultV1.Conversion`: the virtual
+-- assets and shares, the asset bound, and the checks of `docs/MATH.md` §7
+-- that precede each conversion. Every product and quotient goes through
+-- `mulDiv` (D-09).
+module Cayvox.VaultV1.Internal.Conversion
+  ( kmax
+  , unit
+  , dmax
+  , virtualShares
+  , assetCap
+  , Terms (..)
+  , checkedTerms
+  , capacityExceeded
+  ) where
+
+import DA.Fail (failWithStatusPure)
+
+import Cayvox.Api.VaultV1 (VaultView (..))
+import Cayvox.VaultMathV1 (Rounding (..), mulDiv)
+
+import Cayvox.VaultV1.Internal.Failure (vaultCapacityExceeded)
+
+-- | The largest decimals offset, `KMAX` (D-10).
+kmax : Int
+kmax = 10
+
+-- | One unit in the last place of `Decimal`, `u`; also the virtual assets `VA`.
+unit : Decimal
+unit = 0.0000000001
+
+-- | The largest `Decimal`, `DMAX`.
+dmax : Decimal
+dmax = 9999999999999999999999999999.9999999999
+
+-- | The virtual shares `VS = 10^k * u`, for `0 <= k <= KMAX`.
+virtualShares : Int -> Decimal
+virtualShares k = foldl (\vs _ -> mulDiv Floor vs 10.0 1.0) unit [1 .. k]
+
+-- | `AMAX(k) = floor(DMAX / 10^k)`, exact, for `0 <= k <= KMAX`.
+assetCap : Int -> Decimal
+assetCap k = mulDiv Floor dmax unit (virtualShares k)
+
+-- | The terms of a checked view.
+data Terms = Terms with
+    assets : Decimal
+      -- ^ `A + VA`.
+    shares : Decimal
+      -- ^ `S + VS`.
+    room : Decimal
+      -- ^ `AMAX(k) - VA - A`: the most a deposit can add within the asset bound.
+  deriving (Eq, Show)
+
+-- | Fail with `vault-capacity-exceeded`.
+capacityExceeded : a
+capacityExceeded = failWithStatusPure vaultCapacityExceeded
+
+-- | The terms of a view that passes step 1 of `docs/MATH.md` §7: `k` within
+-- `0 <= k <= KMAX`, `A` and `S` not negative, `A + VA <= AMAX(k)`, and
+-- `S + VS <= 10^k (A + VA)`; else `vault-capacity-exceeded`. Each check
+-- runs only after the checks that make its terms representable.
+checkedTerms : VaultView -> Terms
+checkedTerms v
+  | v.decimalsOffset < 0 || v.decimalsOffset > kmax = capacityExceeded
+  | v.totalAssets < 0.0 || v.totalShares < 0.0 = capacityExceeded
+  | otherwise = boundedTerms v (virtualShares v.decimalsOffset) (assetCap v.decimalsOffset)
+
+-- | The bound checks of `checkedTerms`, given `VS` and `AMAX(k)`.
+boundedTerms : VaultView -> Decimal -> Decimal -> Terms
+boundedTerms v vs cap
+  | v.totalAssets > cap - unit = capacityExceeded
+  | v.totalShares > mulDiv Floor (v.totalAssets + unit) vs unit - vs = capacityExceeded
+  | otherwise = Terms with
+      assets = v.totalAssets + unit
+      shares = v.totalShares + vs
+      room = cap - unit - v.totalAssets

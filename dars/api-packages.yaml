@@ -1,0 +1,17 @@
+# API packages of this repository and their recorded main package IDs (D-11).
+#
+# An API package is built once, with SDK 3.4.11, and implementation packages
+# on every SDK consume that one DAR, because a build with another SDK has
+# another package ID. scripts/check-api-ids.sh
+# fails when a build of an API package has another ID or another SDK.
+#
+# A change to an API package's source changes its ID; the new ID is recorded
+# here in the same commit, and for a released package only through a new
+# package version (docs/CONVENTIONS.md, section 4).
+
+packages:
+  - package: cvx-api-vault-v1
+    version: 0.1.0
+    path: packages/token/api-vault-v1
+    sdk-version: 3.4.11
+    main-package-id: 27fcecf990560c97dcef4dd7df8fc655b1348b8c569a3e911fab4de5f5b74656

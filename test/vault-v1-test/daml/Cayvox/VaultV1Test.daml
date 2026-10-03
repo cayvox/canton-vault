@@ -1,0 +1,11 @@
+-- | Tests for `Cayvox.VaultV1`.
+module Cayvox.VaultV1Test where
+
+import Daml.Script
+
+import Cayvox.VaultV1 ()
+
+-- | The production DAR resolves as a data dependency and its public module
+-- imports.
+test_publicModuleImports : Script ()
+test_publicModuleImports = pure ()

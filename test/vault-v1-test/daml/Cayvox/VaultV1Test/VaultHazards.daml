@@ -1,0 +1,433 @@
+-- | Hostile and hazard fixtures of `docs/SECURITY.md` for the vault: T-01,
+-- T-04, T-06, T-10, T-11, T-15, T-17 and T-19, the operator mint of
+-- T-13, and the donation of V-05. Reconciliation (I-01, I-02 and the
+-- vault account's custody) detects T-10, T-11 and T-13.
+module Cayvox.VaultV1Test.VaultHazards where
+
+import DA.Action (when)
+import DA.Assert ((===))
+import DA.Either (isLeft)
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import qualified DA.List
+import DA.Optional (fromSome, isSome)
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import qualified Splice.Api.Token.AllocationInstructionV2 as V2
+import qualified Splice.Api.Token.AllocationV2 as V2A
+import qualified Splice.Api.Token.HoldingV2 as V2H
+import qualified Splice.Api.Token.TransferInstructionV2 as V2T
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+import Splice.Testing.Tokens.TestTokenV2.Transfer (TokenTransferOffer)
+
+import Cayvox.Api.VaultV1 (VaultView (..))
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Conversion
+import Cayvox.VaultV1.Internal.ShareRegistry (ShareAllocation)
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount, burnAccount, receiverSide, senderSide)
+import Cayvox.VaultV1.Internal.Vault (Kind (..), addAssetsLeg, addAssetsSettlement, allocationSpec, inLeg, requestSettlement)
+import Cayvox.VaultV1Test.Hostile (ForgedAllocation (..), ForgedFactory (..), LoneSettler (..), LoneSettler_Take (..))
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+vaultErr : Text -> Expected
+vaultErr name = Status ("cayvox.com/vault-" <> name) InvalidGivenCurrentSystemStateOther
+
+check : Text -> Bool -> Script ()
+check label cond = if cond then pure () else abort label
+
+-- | T-01: first-depositor inflation, on an empty vault and on a vault with
+-- one unit of shares (`S = u`), at offsets 0 and 10. The attacker sends
+-- underlying straight to the vault account before the victim's deposit.
+-- The vault does not count it: the victim's deposit mints what the recorded
+-- state gives, at least its amount, never zero.
+test_hazard_t01_inflationAttack : Script ()
+test_hazard_t01_inflationAttack = forA_ [ (k, oneShare) | k <- [0, 10], oneShare <- [False, True] ] $ \(k, oneShare) -> do
+  w <- setupWorldWith ("t01-" <> show k <> "-" <> show oneShare) Permissioned k 2 1000000.0
+  let [mallory, victim] = w.requesters
+  when oneShare $ do
+    _ <- run =<< depositAll w w.operator [(mallory, 1.0, False)]
+    (held, _) <- S.balanceOf w.shares mallory
+    _ <- run =<< redeemAll w w.operator [(mallory, held - u, False)]
+    totalsOf w >>= (=== (u, u))
+  (_, before) <- vaultOf w
+  mintUnderlying w.underlying w.operator 900000.0
+  res <- run =<< depositAll w w.operator [(victim, 100.0, False)]
+  res.outputs === [previewDeposit (viewOf before) 100.0]
+  check ("the victim's deposit mints at least its amount: " <> show res.outputs) (all (>= 100.0) res.outputs)
+  where u = 0.0000000001
+
+-- | T-10: the operator moves underlying out of the vault account outside
+-- any vault choice, as the registry lets any owner do. The vault state is unchanged;
+-- reconciliation detects that the account holds less than `A`.
+test_hazard_t10_operatorMovesCustody : Script ()
+test_hazard_t10_operatorMovesCustody = do
+  w <- setupWorld "t10" Permissioned 0 1
+  let [alice] = w.requesters
+  receiver <- allocateParty "receiver-t10"
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  reconcile w j >>= \r -> check ("honest state reconciles: " <> show r) (reconciles r)
+  inputs <- underlyingHoldings w.underlying w.operator
+  d <- underlyingDisclosure w.underlying
+  now <- getTime
+  res <- submit (actAs w.operator <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2T.TransferFactory w.underlying.rules) V2T.TransferFactory_Transfer with
+      transfer = V2T.Transfer with
+        sender = basicAccount w.operator; receiver = basicAccount receiver; amount = 60.0
+        instrumentId = underlyingInstrument w.underlying; requestedAt = now
+        executeBefore = addRelTime now (days 1); inputHoldingCids = inputs; meta = emptyMetadata
+      actors = [w.operator]; extraArgs = underlyingArgs w.underlying
+  offer <- case res.output of
+    V2T.TransferInstructionResult_Pending {transferInstructionCid} -> pure transferInstructionCid
+    other -> abort ("transfer not pending: " <> show other)
+  offerD <- fromSome <$> queryDisclosure @TokenTransferOffer w.operator (coerceContractId offer)
+  heldD <- tokenDisclosures w.operator =<< map fst <$> accountHoldings w.underlying (basicAccount w.operator)
+  _ <- submit (actAs receiver <> discloseMany (d :: offerD :: heldD)) $
+    exerciseCmd offer V2T.TransferInstruction_Accept with actors = [receiver]; extraArgs = underlyingArgs w.underlying
+  r <- reconcile w j
+  check ("the outside movement is detected: " <> show r) (not (reconciles r))
+  (r.recordedAssets, r.journalAssets, r.custody) === (100.0, 100.0, 40.0)
+
+-- | T-04: a request for one vault, executed by a second vault of the same
+-- operator, is refused.
+test_hazard_t04_secondVaultOfTheOperator : Script ()
+test_hazard_t04_secondVaultOfTheOperator = do
+  w <- setupWorld "t04" Permissioned 0 1
+  let [alice] = w.requesters
+  (_, v) <- vaultOf w
+  second <- submit w.operator $ createCmd v with vaultId = "second"
+  r <- newDeposit w alice 10.0 0.0 False
+  i <- depositItem w alice r
+  s <- executeDeposits w w.operator [(alice, i)]
+  let onSecond = exerciseCmd second Vault_ExecuteDeposits with
+        executor = w.operator; items = [i]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+  attempt (s with commands = onSecond) >>= assertFails (vaultErr "wrong-vault")
+  attempt s >>= either (abort . show) (const (pure ()))
+
+-- | T-06: Mallory funds her deposit request with an allocation of her own
+-- template whose view claims every field of the binding. The vault refuses
+-- it before any settlement, and no share reaches Mallory.
+test_hazard_t06_forgedFundingAllocation : Script ()
+test_hazard_t06_forgedFundingAllocation = do
+  w <- setupWorld "t06" Permissioned 0 1
+  let [mallory] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  req <- submit mallory $ createCmd DepositRequest with
+    requester = mallory; operator = w.operator; vaultId = w.vaultId
+    payAccount = basicAccount mallory; receiver = basicAccount mallory
+    amount = 10.0; minOut = 0.0; deadline; funded = True; meta = emptyMetadata
+  (_, v) <- vaultOf w
+  let leg = inLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount mallory) 10.0
+      claimed = V2A.AllocationView with
+        originalAllocationCid = None
+        settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId req)
+        allocation = allocationSpec w.underlying.admin (basicAccount mallory) (senderSide leg) (Some deadline) True
+        holdingCids = []; createdAt = now; numIterations = 0; expiresAt = None
+        availableActions = mempty; meta = emptyMetadata
+  forged <- submit mallory $ createCmd ForgedAllocation with
+    mallory; operator = w.operator; instrument = v.shareInstrument; forgedView = claimed
+  let item = DepositItem with request = req; fundingAllocation = Some (toInterfaceContractId forged); fundingInputs = []
+  tryS (executeDeposits w w.operator [(mallory, item)]) >>= assertFails (vaultErr "allocation-mismatch")
+  positionOf w mallory >>= (=== ((1000.0, 0.0), (0.0, 0.0)))
+  totalsOf w >>= (=== (0.0, 0.0))
+
+-- | T-06: an asset addition offered a forged allocation whose view claims
+-- the addition's settlement and leg is refused before any settlement, as
+-- for a request's funding allocation.
+test_hazard_t06_forgedAddAssetsAllocation : Script ()
+test_hazard_t06_forgedAddAssetsAllocation = do
+  w <- setupWorld "t06-add" Permissioned 0 1
+  let [mallory] = w.requesters
+  _ <- run =<< depositAll w w.operator [(mallory, 10.0, False)]
+  now <- getTime
+  (cid, v) <- vaultOf w
+  let source = basicAccount mallory
+      leg = addAssetsLeg v.vaultAccount v.asset source 5.0
+      claimed = V2A.AllocationView with
+        originalAllocationCid = None
+        settlement = addAssetsSettlement w.operator w.vaultId (coerceContractId cid)
+        allocation = allocationSpec w.underlying.admin source (senderSide leg) None False
+        holdingCids = []; createdAt = now; numIterations = 0; expiresAt = None
+        availableActions = mempty; meta = emptyMetadata
+  forged <- submit mallory $ createCmd ForgedAllocation with
+    mallory; operator = w.operator; instrument = v.shareInstrument; forgedView = claimed
+  ud <- underlyingDisclosure w.underlying
+  trySubmit (actAs w.operator <> disclose ud) (exerciseCmd cid Vault_AddAssets with
+    amount = 5.0; source; funding = toInterfaceContractId forged; assetContext = underlyingArgs w.underlying)
+    >>= assertFails (vaultErr "allocation-mismatch")
+  totalsOf w >>= (=== (10.0, 10.0))
+  S.balanceOf w.shares mallory >>= (=== (10.0, 0.0))
+
+-- | T-06: the factories come only from the vault state. Mallory cannot
+-- create a vault state of the operator that names another factory, and a
+-- contract of another template passed as the vault fails the request's
+-- typed fetch (`docs/SPEC.md` §4.2, check 1).
+test_hazard_t06_forgedVaultAndFactory : Script ()
+test_hazard_t06_forgedVaultAndFactory = do
+  w <- setupWorld "t06-vault" Permissioned 0 1
+  let [mallory] = w.requesters
+  now <- getTime
+  (_, v) <- vaultOf w
+  trySubmit mallory (createCmd v with assetRegistry = v.shareRegistry) >>= assertFails Authorization
+  (req, _) <- newDeposit w mallory 10.0 0.0 False
+  let leg = inLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount mallory) 1.0
+  notAVault <- submit mallory $ createCmd ForgedAllocation with
+    mallory; operator = w.operator; instrument = v.shareInstrument
+    forgedView = V2A.AllocationView with
+      originalAllocationCid = None
+      settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId req)
+      allocation = allocationSpec w.operator (basicAccount mallory) (senderSide leg) None False
+      holdingCids = []; createdAt = now; numIterations = 0; expiresAt = None
+      availableActions = mempty; meta = emptyMetadata
+  let asVault = coerceContractId notAVault : ContractId VaultState
+  trySubmit w.operator (exerciseCmd req DepositRequest_Allocate with
+    vault = asVault; receiptLeg = leg; fundingInputs = []
+    assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails (WrongTemplate (show asVault))
+
+-- | T-11: the operator archives the vault state and recreates it with other
+-- totals. Reconciliation against the share registry and the vault account
+-- detects it; every honest step before it reconciles.
+test_hazard_t11_operatorRewritesTotals : Script ()
+test_hazard_t11_operatorRewritesTotals = do
+  w <- setupWorld "t11" Permissioned 0 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  honest <- reconcile w j
+  check ("honest state reconciles: " <> show honest) (reconciles honest)
+  (cid, v) <- vaultOf w
+  submit w.operator $ archiveCmd cid
+  _ <- submit w.operator $ createCmd v with totalAssets = 150.0; totalShares = 100.0
+  tampered <- reconcile w j
+  check ("the rewritten totals are detected: " <> show tampered) (not (reconciles tampered))
+  tampered.recordedAssets === 150.0
+  tampered.journalAssets === 100.0
+
+-- | T-13: the operator mints shares outside any vault execution.
+-- Reconciliation detects it (I-02).
+test_hazard_r25_operatorMintsOutsideTheVault : Script ()
+test_hazard_r25_operatorMintsOutsideTheVault = do
+  w <- setupWorld "r25" Permissioned 0 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  reconcile w j >>= \r -> check ("honest state reconciles: " <> show r) (reconciles r)
+  _ <- S.mintShares w.shares alice 50.0 "outside"
+  r <- reconcile w j
+  check ("the outside mint is detected: " <> show r) (not (reconciles r))
+  (r.recordedShares, r.shareSupply) === (100.0, 150.0)
+
+-- | T-15: one requester cannot fetch another's request, allocation or share
+-- holding.
+test_hazard_t15_requestersAreIsolated : Script ()
+test_hazard_t15_requestersAreIsolated = do
+  w <- setupWorld "t15" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 100.0, False)]
+  (req, Some alloc) <- newRedeem w alice 10.0 0.0 True
+  assertNotVisible alice bob req
+  assertNotVisible alice bob (fromInterfaceContractId @ShareAllocation alloc)
+  hs <- S.holdingsOf w.shares alice
+  forA_ hs $ \(h, _) -> assertNotVisible alice bob h
+
+-- | T-17: Bob executes Alice's request. Permissioned: refused before any
+-- request is read. Permissionless: refused with the request disclosed, and
+-- the request is not found without it.
+test_hazard_t17_bobExecutesAlicesRequest : Script ()
+test_hazard_t17_bobExecutesAlicesRequest = forA_ [Permissioned, Permissionless] $ \mode -> do
+  w <- setupWorld ("t17-" <> show mode) mode 0 2
+  let [alice, bob] = w.requesters
+  r <- newDeposit w alice 10.0 0.0 False
+  i <- depositItem w alice r
+  s <- executeDeposits w bob [(alice, i)]
+  rd <- fromSome <$> queryDisclosure alice (fst r)
+  attempt (s with disclosures = rd :: s.disclosures) >>= assertFails (vaultErr "unauthorized-executor")
+  when (mode == Permissionless) $
+    attempt s >>= assertFails (ContractUnavailable (show (fst r)))
+  positionOf w alice >>= (=== ((1000.0, 0.0), (0.0, 0.0)))
+
+-- | T-19: at the deadline instant, the funded input's lock has expired and
+-- the requester can spend the holding, while an execution is refused by the
+-- vault before any upstream check.
+test_hazard_t19_theDeadlineInstant : Script ()
+test_hazard_t19_theDeadlineInstant = do
+  w <- setupWorld "t19" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  r <- newDepositUntil w alice 100.0 0.0 True deadline
+  i <- depositItem w alice r
+  setTime deadline
+  tryS (executeDeposits w w.operator [(alice, i)]) >>= assertFails (vaultErr "request-expired")
+  -- From the deadline on, the locked holding is spendable as an input
+  -- (TestTokenV2 lock `expiresAt = settlementDeadline`, [`Allocation.daml`](https://github.com/canton-network/splice/blob/0.8.4/token-standard/examples/splice-test-token-v2/daml/Splice/Testing/Tokens/TestTokenV2/Allocation.daml#L444-L448)): Alice
+  -- allocates it to another settlement.
+  hs <- queryInterface @V2H.Holding w.underlying.admin
+  let locked = [ cid | (cid, Some v) <- hs, v.account == basicAccount alice, isSome v.lock ]
+  check "the funded input is locked" (not (null locked))
+  (_, v) <- vaultOf w
+  d <- underlyingDisclosure w.underlying
+  let elsewhere = V2A.SettlementInfo with executors = [alice]; id = "elsewhere"; cid = None; meta = emptyMetadata
+      leg = inLeg Deposit (basicAccount alice) v.asset v.shareInstrument (basicAccount alice) 100.0
+  res <- submit (actAs alice <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2.AllocationFactory w.underlying.rules) V2.AllocationFactory_Allocate with
+      settlement = elsewhere
+      allocation = allocationSpec w.underlying.admin (basicAccount alice) (senderSide leg) None False
+      requestedAt = deadline; inputHoldingCids = locked; extraArgs = underlyingArgs w.underlying; actors = [alice]
+  _ <- completed res
+  tryS (executeDeposits w w.operator [(alice, i)]) >>= assertFails (vaultErr "request-expired")
+
+-- | V-05: a donation to the vault account leaves `A`, `S` and every
+-- conversion unchanged, and the vault still reconciles.
+test_hazard_v05_donationChangesNothing : Script ()
+test_hazard_v05_donationChangesNothing = forA_ [0, 10] $ \k -> do
+  w <- setupWorld ("v05-" <> show k) Permissioned k 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  (_, before) <- vaultOf w
+  mintUnderlying w.underlying w.operator 500.0
+  (_, after) <- vaultOf w
+  after === before
+  let previews v = [ f (viewOf v) x | f <- [convertToShares, convertToAssets, previewDeposit, previewMint, previewWithdraw, previewRedeem]
+                                    , x <- [0.0000000001, 1.0, 37.5] ]
+  previews after === previews before
+  r <- reconcile w j
+  check ("reconciles after a donation: " <> show r) (reconciles r)
+
+viewOf : VaultState -> VaultView
+viewOf v = VaultView with
+  operator = v.operator; vaultId = v.vaultId; asset = v.asset; shareInstrument = v.shareInstrument
+  totalAssets = v.totalAssets; totalShares = v.totalShares; decimalsOffset = v.decimalsOffset
+  mode = v.mode; paused = v.paused; meta = v.meta
+
+-- | T-20: a factory signed by Mallory, recorded in the
+-- vault state by the operator's mistake, runs with the vault's authority.
+-- The in-memory ledger vets every package, so here it mints Mallory shares
+-- during an honest execution; on Canton the operator's participant runs
+-- only packages it has vetted. Reconciliation reports the mint (I-02).
+test_hazard_b07_forgedFactory : Script ()
+test_hazard_b07_forgedFactory = do
+  w <- setupWorld "b07" Permissioned 0 1
+  let [alice] = w.requesters
+  mallory <- allocateParty "mallory-b07"
+  forged <- submit mallory $ createCmd ForgedFactory with
+    mallory; operator = w.operator; instrument = w.shares.instrument
+    claimedAdmin = w.underlying.admin; real = toInterfaceContractId w.underlying.rules
+  (cid, v) <- vaultOf w
+  submit w.operator $ archiveCmd cid
+  _ <- submit w.operator $ createCmd v with
+    assetRegistry = v.assetRegistry with allocationFactory = toInterfaceContractId forged
+  -- A funded request: the first call to the forged factory is the vault's own,
+  -- with `actors = [operator]`.
+  j <- journaled w =<< depositAll w w.operator [(alice, 10.0, True)]
+  minted <- S.balanceOf w.shares mallory
+  minted === (1000000.0, 0.0)
+  r <- reconcile w j
+  check ("the forged factory's mint is detected: " <> show r) (not (reconciles r))
+  (r.recordedShares, r.shareSupply) === (10.0, 1000010.0)
+
+-- | T-21: every request settlement names the
+-- operator as its only executor, so the operator can settle a request's
+-- input leg alone, outside any vault choice: here a funded redemption's
+-- shares are burned and nothing is paid. Not preventable under D-04;
+-- reconciliation reports it (I-02).
+test_hazard_t21_operatorSettlesInputAlone : Script ()
+test_hazard_t21_operatorSettlesInputAlone = do
+  w <- setupWorld "t21" Permissioned 0 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 10.0, False)]
+  (req, Some alloc) <- newRedeem w alice 4.0 4.0 True
+  (_, v) <- vaultOf w
+  let settlement = requestSettlement w.operator w.vaultId Redeem (coerceContractId req)
+      leg = inLeg Redeem v.vaultAccount v.asset v.shareInstrument (basicAccount alice) 4.0
+  (burn, _) <- S.allocate w.shares [w.operator] settlement
+    (allocationSpec w.operator burnAccount (receiverSide leg) None False) []
+  _ <- S.settle w.shares settlement [leg] [alloc, burn]
+  (held, locked) <- S.balanceOf w.shares alice
+  held + locked === 6.0
+  (free, _) <- underlyingBalance w.underlying alice
+  free === 990.0
+  r <- reconcile w j
+  check ("the lone input settlement is detected: " <> show r) (not (reconciles r))
+  (r.recordedShares, r.shareSupply) === (10.0, 6.0)
+
+-- | Registry migration: the factories are contract IDs fixed in the vault
+-- state. When a registry replaces its factory, the operator migrates the
+-- vault by archiving the state and creating it again with the new factory
+-- and every other field unchanged; reconciliation then still holds, and the
+-- vault executes again (`docs/SECURITY.md` §2, "Registry migration").
+test_hazard_b04_registryMigration : Script ()
+test_hazard_b04_registryMigration = do
+  w <- setupWorld "b04" Permissioned 0 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 10.0, False)]
+  -- The share registry replaces its rules contract.
+  submit w.operator $ archiveCmd w.shares.rules
+  rules' <- submit w.operator $ createCmd ShareRules with
+    admin = w.operator; instrumentId = w.shares.instrument; meta = emptyMetadata
+  let w' = w with shares = w.shares with rules = rules'
+  -- The vault, still naming the archived rules, cannot execute.
+  tryS (depositAll w' w.operator [(alice, 1.0, False)]) >>= \r -> check "stale factory refused" (isLeft r)
+  -- Migration: the same state with the new factories.
+  (cid, v) <- vaultOf w'
+  submit w.operator $ archiveCmd cid
+  let ref = RegistryRef with
+        allocationFactory = toInterfaceContractId rules'; settlementFactory = toInterfaceContractId rules'
+  _ <- submit w.operator $ createCmd v with shareRegistry = ref
+  reconcile w' j >>= \r -> check ("migration reconciles: " <> show r) (reconciles r)
+  j' <- journaled w' =<< depositAll w' w.operator [(alice, 5.0, False)]
+  reconcile w' (j + j') >>= \r -> check ("executions continue: " <> show r) (reconciles r)
+
+-- | T-21 with execution-time funding (an unfunded request), once the
+-- requester has handed its holdings to the operator, as a Permissioned
+-- execution needs: no funding allocation exists before the execution, but
+-- the operator controls the request's delegation choice, so it can create
+-- one outside any execution and settle the input leg alone in the same
+-- transaction. Reconciliation reports the inflow (custody above the journal).
+test_hazard_t21_executionTimeFunding_holdingsHanded : Script ()
+test_hazard_t21_executionTimeFunding_holdingsHanded = do
+  w <- setupWorld "t21-exec" Permissioned 0 1
+  let [alice] = w.requesters
+  (req, None) <- newDeposit w alice 100.0 0.0 False
+  (cid, _) <- vaultOf w
+  inputs <- underlyingHoldings w.underlying alice
+  ud <- underlyingDisclosure w.underlying
+  held <- tokenDisclosures alice inputs
+  settler <- submit w.operator $ createCmd LoneSettler with operator = w.operator
+  _ <- submit (actAs w.operator <> discloseMany (ud :: held)) $ exerciseCmd settler LoneSettler_Take with
+    vault = cid; request = req; fundingInputs = inputs; receiptAmount = 1.0
+    assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+  (free, _) <- underlyingBalance w.underlying alice
+  free === 900.0
+  (held', _) <- S.balanceOf w.shares alice
+  held' === 0.0
+  r <- reconcile w 0.0
+  (r.recordedAssets, r.custody) === (0.0, 100.0)
+
+-- | T-21 with execution-time funding in Permissionless mode: the requester
+-- submits its own execution and never hands its holdings to the operator.
+-- The operator holds no funding allocation and cannot use the requester's
+-- holdings, so it cannot settle the requester's input alone; nothing moves.
+test_hazard_t21_executionTimeFunding_permissionless : Script ()
+test_hazard_t21_executionTimeFunding_permissionless = do
+  w <- setupWorld "t21-exec-pl" Permissionless 0 1
+  let [alice] = w.requesters
+  (req, None) <- newDeposit w alice 100.0 0.0 False
+  (cid, _) <- vaultOf w
+  inputs <- underlyingHoldings w.underlying alice
+  ud <- underlyingDisclosure w.underlying
+  settler <- submit w.operator $ createCmd LoneSettler with operator = w.operator
+  trySubmit (actAs w.operator <> disclose ud) (exerciseCmd settler LoneSettler_Take with
+      vault = cid; request = req; fundingInputs = inputs; receiptAmount = 1.0
+      assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails (ContractUnavailable (show (DA.List.head inputs)))
+  (free, _) <- underlyingBalance w.underlying alice
+  free === 1000.0
+  -- The requester then executes its own request, and it settles as usual.
+  item <- depositItem w alice (req, None)
+  res <- run =<< executeDeposits w alice [(alice, item)]
+  res.outputs === [100.0]
+

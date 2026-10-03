@@ -1,0 +1,503 @@
+-- | Seeded operation sequences for gate Q-08 (`docs/TESTING.md`): deposits,
+-- redemptions, cancellations, pauses, asset additions, batches and
+-- donations, in both modes, at offsets 0 and 10, with one or three
+-- requesters. Every operation's outcome is predicted from the vault's view
+-- before it runs: whether the vault accepts it and, if so, every amount.
+-- After every step the sequence checks I-01 to I-08 (`docs/SPEC.md` §6),
+-- the view invariant K-01 and V-01 to V-05 (`docs/MATH.md` §8). Run by
+-- `scripts/check-sequences.py` through `dpm script`.
+module Cayvox.VaultV1Test.Sequences
+  ( SequenceInput (..)
+  , runSequences
+  ) where
+
+import DA.Action (foldlA)
+import DA.List (head, (!!))
+import qualified DA.Map as Map
+import DA.Optional (fromOptional, isNone, isSome)
+import qualified DA.Text as T
+import Daml.Script
+
+import qualified Splice.Api.Token.HoldingV2 as V2
+
+import Cayvox.Api.VaultV1 (Vault, VaultView (..))
+import Cayvox.Testing.Assert (Expected (..), matches)
+import Cayvox.VaultMathV1 (Rounding (..), mulDiv)
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Conversion
+import Cayvox.VaultV1.Internal.Conversion (assetCap, unit, virtualShares)
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount)
+import Cayvox.VaultV1.Internal.Vault (shareCap)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+-- | The sequences with seeds `first` to `first + count - 1`, each of at
+-- most `steps` operations.
+data SequenceInput = SequenceInput with
+    first : Int
+    count : Int
+    steps : Int
+  deriving (Eq, Show)
+
+-- | One line per sequence: its seed, mode, offset, requesters, operations
+-- and the number of invariant checks, then `ok` or the first violation.
+runSequences : SequenceInput -> Script [Text]
+runSequences input = forA [input.first .. input.first + input.count - 1] (runSequence input.steps)
+
+-- Generator
+------------
+
+-- | A linear congruential generator modulo 2^31.
+next : Int -> Int
+next x = (1103515245 * x + 12345) % 2147483648
+
+-- | A value of 30 bits from the high bits of two steps of the generator,
+-- whose low bits have short periods, and the generator's new state.
+draw : Int -> (Int, Int)
+draw x =
+  let a = next x
+      b = next a
+  in ((a / 65536) * 32768 + b / 65536, b)
+
+-- | An amount between `scale / 10^6` and `scale`, at `Decimal` precision,
+-- and at least `u`.
+amountFrom : Int -> Decimal -> Decimal
+amountFrom r scale = max unit (mulDiv Floor (intToDecimal (1 + r % 1000000)) scale 1000000.0)
+
+-- | One of three scales: up to 1,000, up to 1, or near `u`.
+scaled : Int -> Decimal
+scaled r = case r % 3 of
+  0 -> amountFrom (fst (draw r)) 1000.0
+  1 -> amountFrom (fst (draw r)) 1.0
+  _ -> amountFrom (fst (draw r)) 0.000000001
+
+-- State
+--------
+
+-- | A request left active by a refused execution.
+data Pending = PendingDeposit (ContractId DepositRequest) | PendingRedeem (ContractId RedeemRequest)
+
+data SeqState = SeqState with
+    w : World
+    initial : VaultState
+    journal : Decimal
+      -- ^ Underlying moved into the vault account by vault choices, minus
+      -- what they moved out (I-01).
+    donated : Decimal
+      -- ^ Underlying sent to the vault account outside vault choices.
+    yieldAdded : Bool
+    ins : Map.Map Party Decimal
+    outs : Map.Map Party Decimal
+    pending : [(Party, Pending)]
+    ops : [Text]
+    checks : Int
+    violation : Optional Text
+    refusal : Text
+      -- ^ The last refusal, for the report of a violation.
+    rng : Int
+
+violate : SeqState -> Text -> SeqState
+violate st msg = if isNone st.violation then st with violation = Some msg else st
+
+record : SeqState -> Text -> SeqState
+record st op = st with ops = op :: st.ops
+
+viewOf : VaultState -> VaultView
+viewOf v = view (toInterface @Vault v)
+
+roll : SeqState -> (Int, SeqState)
+roll st = let (r, x) = draw st.rng in (r, st with rng = x)
+
+-- Sequence
+-----------
+
+runSequence : Int -> Int -> Script Text
+runSequence steps seed = do
+  let (r0, x0) = draw seed
+      mode = if seed % 2 == 0 then Permissioned else Permissionless
+      k = if (seed / 2) % 2 == 0 then 0 else 10
+      n = if (seed / 4) % 2 == 0 then 1 else 3
+      len = min steps (10 + r0 % 41)
+  w <- setupWorldWith ("seq-" <> show seed) mode k n 1000000.0
+  (_, initial) <- vaultOf w
+  let st0 = SeqState with
+        w; initial; journal = 0.0; donated = 0.0; yieldAdded = False; ins = Map.empty; outs = Map.empty
+        pending = []; ops = []; checks = 0; violation = None; refusal = ""; rng = x0
+  final <- foldlA (\st _ -> if isNone st.violation then step st else pure st) st0 [1 .. len]
+  let summary = T.intercalate " "
+        [ "seed=" <> show seed, show mode, "k=" <> show k, "requesters=" <> show n
+        , "operations=" <> show (length final.ops), "checks=" <> show final.checks
+        , "[" <> T.intercalate "," (reverse final.ops) <> "]" ]
+  pure $ case final.violation of
+    None -> summary <> " ok"
+    Some v -> summary <> " VIOLATION " <> v
+
+-- | One operation, chosen by the generator, then every invariant.
+step : SeqState -> Script SeqState
+step st0 = do
+  let (r, st) = roll st0
+  st' <- case r % 20 of
+    c | c < 6 -> deposit st r
+      | c < 10 -> redeem st r
+      | c < 12 -> cancel st r
+      | c < 14 -> togglePause st r
+      | c < 16 -> addAssetsStep st r
+      | c < 19 -> batch st r
+      | otherwise -> donate st r
+  invariants st'
+
+-- Running a vault choice
+-------------------------
+
+-- | The executor of a request of `p` in this vault's mode.
+executorFor : World -> Party -> Party
+executorFor w p = if w.mode == Permissioned then w.operator else p
+
+-- | Try a vault choice. On success, add its flow into the vault account,
+-- read from its transaction tree, to the journal; on refusal, check that
+-- the vault and its custody are unchanged.
+tryVault : SeqState -> Submission a -> Script (SeqState, Optional (a, Decimal, Decimal, Decimal))
+tryVault st s = do
+  (_, before) <- vaultOf st.w
+  held <- accountHoldings st.w.underlying (basicAccount st.w.operator)
+  res <- trySubmitResultAndTree (actAs s.submitter <> discloseMany s.disclosures) s.commands
+  (_, after) <- vaultOf st.w
+  case res of
+    Right (x, tree) -> do
+      let flow = vaultAccountFlow st.w (Map.fromList held) tree
+      pure ((st with journal = st.journal + flow),
+            Some (x, after.totalAssets - before.totalAssets, after.totalShares - before.totalShares, flow))
+    Left e -> do
+      held' <- accountHoldings st.w.underlying (basicAccount st.w.operator)
+      pure $ if after == before && map snd held' == map snd held then ((st with refusal = show e), None)
+        else (violate st "a refused vault choice changed the vault or its custody", None)
+
+-- | Compare an outcome with its prediction.
+expect : SeqState -> Text -> Bool -> Optional b -> (b -> Optional Text) -> SeqState
+expect st label predicted outcome check = case (predicted, outcome) of
+  (True, None) -> violate st (label <> ": predicted to execute, refused: " <> st.refusal)
+  (False, Some _) -> violate st (label <> ": predicted to be refused, executed")
+  (False, None) -> record st (label <> "-refused")
+  (True, Some x) -> case check x of
+    None -> record st label
+    Some msg -> violate st (label <> ": " <> msg)
+
+-- Deposits and redemptions
+---------------------------
+
+-- | A minimum output: none, exactly the predicted amount, or one unit more.
+minOutFor : Int -> Decimal -> Decimal
+minOutFor r predicted = case r % 5 of
+  0 -> predicted
+  1 -> predicted + unit
+  _ -> 0.0
+
+-- | The predicted outputs of a batch, item by item on the running view, and
+-- whether every item passes the checks of `docs/SPEC.md` §5.3 or §5.4.
+predict : Kind' -> VaultView -> [(Decimal, Decimal)] -> ([Decimal], Bool)
+predict _ _ [] = ([], True)
+predict kind v ((amount, minOut) :: rest) =
+  let out = case kind of
+        DepositK -> previewDeposit v amount
+        RedeemK -> previewRedeem v amount
+      allowed = case kind of
+        DepositK -> not v.paused
+        RedeemK -> out <= v.totalAssets
+      ok = out > 0.0 && out >= minOut && allowed
+      v' = case kind of
+        DepositK -> v with totalAssets = v.totalAssets + amount; totalShares = v.totalShares + out
+        RedeemK -> v with totalAssets = v.totalAssets - out; totalShares = v.totalShares - amount
+      (outs, oks) = if ok then predict kind v' rest else ([], False)
+  in (out :: outs, ok && oks)
+
+data Kind' = DepositK | RedeemK deriving (Eq, Show)
+
+-- | A deposit of one requester, funded or not, with a minimum output that
+-- the prediction may or may not meet.
+deposit : SeqState -> Int -> Script SeqState
+deposit st r = do
+  let w = st.w
+      p = w.requesters !! (r % length w.requesters)
+  (free, _) <- underlyingBalance w.underlying p
+  let amount = min (scaled (r / 3)) free
+  (_, v) <- vaultOf w
+  let ([shares], _) = predict DepositK (viewOf v) [(amount, 0.0)]
+      minOut = minOutFor (r / 7) shares
+      (_, ok) = predict DepositK (viewOf v) [(amount, minOut)]
+  req <- newDeposit w p amount minOut ((r / 11) % 2 == 0)
+  item <- depositItem w p req
+  s <- executeDeposits w (executorFor w p) [(p, item)]
+  (st1, res) <- tryVault st s
+  let st2 = expect st1 "deposit" ok res $ \(x, dA, dS, flow) ->
+        if x.outputs /= [shares] then Some ("minted " <> show x.outputs <> ", predicted " <> show shares)
+        else if (dA, dS, flow) /= (amount, shares, amount) then Some ("moved " <> show (dA, dS, flow))
+        else if v.totalAssets == 0.0 && v.totalShares == 0.0 && shares /= tenPow v.decimalsOffset amount
+          then Some ("V-04: the first deposit of " <> show amount <> " minted " <> show shares)
+        else None
+  if isSome res
+    then reexecute (st2 with ins = Map.insertWith (+) p amount st2.ins) (executorFor w p) (fst req) $ \cid ->
+      exerciseCmd cid Vault_ExecuteDeposits with
+        executor = executorFor w p; items = [item]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+    else pure (st2 with pending = (p, PendingDeposit (fst req)) :: st2.pending)
+
+-- | `a * 10^k`, exactly.
+tenPow : Int -> Decimal -> Decimal
+tenPow k a = foldl (\x _ -> mulDiv Floor x 10.0 1.0) a [1 .. k]
+
+-- | I-05: an executed request does not execute again. The execution is
+-- submitted again against the successor state, with the same item, so that
+-- it can fail only on the consumed request, and the failure must name that
+-- request.
+reexecute : SeqState -> Party -> ContractId r -> (ContractId VaultState -> Commands a) -> Script SeqState
+reexecute st executor request command = do
+  (cid, _) <- vaultOf st.w
+  ud <- underlyingDisclosure st.w.underlying
+  od <- operatorDisclosures st.w executor
+  again <- trySubmit (actAs executor <> discloseMany (ud :: od)) (command cid)
+  pure $ case again of
+    Right _ -> violate st "I-05: a request executed twice"
+    Left e | matches (ContractUnavailable (show request)) e -> st
+    Left e -> violate st ("I-05: a second execution failed for another reason: " <> show e)
+
+-- | A redemption of part or all of one requester's unlocked shares.
+redeem : SeqState -> Int -> Script SeqState
+redeem st r = do
+  let w = st.w
+      p = w.requesters !! (r % length w.requesters)
+  (held, _) <- S.balanceOf w.shares p
+  if held == 0.0 then pure (record st "redeem-none") else do
+    let amount = if (r / 3) % 4 == 0 then held else min held (scaled (r / 5))
+    (_, v) <- vaultOf w
+    let ([assets], _) = predict RedeemK (viewOf v) [(amount, 0.0)]
+        minOut = minOutFor (r / 7) assets
+        (_, ok) = predict RedeemK (viewOf v) [(amount, minOut)]
+    req <- newRedeem w p amount minOut ((r / 11) % 2 == 0)
+    item <- redeemItem w p req
+    s <- executeRedeems w (executorFor w p) [(p, item)]
+    (st1, res) <- tryVault st s
+    let st2 = expect st1 "redeem" ok res $ \(x, dA, dS, flow) ->
+          if x.outputs /= [assets] then Some ("paid " <> show x.outputs <> ", predicted " <> show assets)
+          else if (dA, dS, flow) /= (negate assets, negate amount, negate assets) then Some ("moved " <> show (dA, dS, flow))
+          else None
+    if isSome res
+      then reexecute (st2 with outs = Map.insertWith (+) p assets st2.outs) (executorFor w p) (fst req) $ \cid ->
+        exerciseCmd cid Vault_ExecuteRedeems with
+          executor = executorFor w p; items = [item]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+      else pure (st2 with pending = (p, PendingRedeem (fst req)) :: st2.pending)
+
+-- | A batch: deposits or redemptions of every requester in Permissioned
+-- mode; in Permissionless mode, up to three requests of one requester, its
+-- own executor. Funded requests come before the one unfunded request of a
+-- requester, whose inputs are its remaining unlocked holdings.
+batch : SeqState -> Int -> Script SeqState
+batch st r = do
+  let w = st.w
+      ps = if w.mode == Permissioned then w.requesters else [w.requesters !! (r % length w.requesters)]
+      perParty = if w.mode == Permissioned then 1 else 1 + (r / 5) % 3
+      fundedFor i = i < perParty - 1 || (r / 17) % 2 == 0
+      executor = executorFor w (head ps)
+  (_, v) <- vaultOf w
+  if (r / 3) % 2 == 0 then do
+    asks <- fmap concat $ forA ps $ \p -> do
+      (free, _) <- underlyingBalance w.underlying p
+      pure [ (p, i, min (scaled (r / 7 + i)) (mulDiv Floor free 1.0 4.0)) | i <- [0 .. perParty - 1] ]
+    let (outs, ok) = predict DepositK (viewOf v) [ (a, 0.0) | (_, _, a) <- asks ]
+    items <- forA asks $ \(p, i, a) -> do
+      req <- newDeposit w p a 0.0 (fundedFor i)
+      item <- depositItem w p req
+      pure (p, item)
+    s <- executeDeposits w executor items
+    (st1, res) <- tryVault st s
+    let total = sum [ a | (_, _, a) <- asks ]
+        label = "deposits" <> show (length asks)
+        st2 = expect st1 label ok res $ \(x, dA, dS, flow) ->
+          if x.outputs /= outs then Some ("minted " <> show x.outputs <> ", predicted " <> show outs)
+          else if (dA, dS, flow) /= (total, sum outs, total) then Some ("moved " <> show (dA, dS, flow))
+          else None
+        st3 = if isSome res then (st2 with ins = foldl (\m (p, _, a) -> Map.insertWith (+) p a m) st2.ins asks) else st2
+    pure st3 with pending = st3.pending ++ (if isSome res then [] else [ (p, PendingDeposit i.request) | (p, i) <- items ])
+  else do
+    candidates <- fmap concat $ forA ps $ \p -> do
+      (held, _) <- S.balanceOf w.shares p
+      let share = mulDiv Floor held 1.0 (intToDecimal perParty)
+      pure [ (p, i, min (scaled (r / 7 + i)) share) | share > 0.0, i <- [0 .. perParty - 1] ]
+    pool <- vaultHoldings w
+    -- Each redemption pays from its own vault-account holdings, chosen by
+    -- the executor (`docs/SPEC.md` §5.4): the batch keeps the longest
+    -- prefix that the holdings cover, one disjoint set per request.
+    let (predicted, _) = predict RedeemK (viewOf v) [ (a, 0.0) | (_, _, a) <- candidates ]
+        payers = assignHoldings pool predicted
+        asks = take (length payers) candidates
+    if null asks then pure (record st "redeems-none") else do
+      let (outs, ok) = predict RedeemK (viewOf v) [ (a, 0.0) | (_, _, a) <- asks ]
+      reqs <- forA asks $ \(p, i, a) -> do
+        req <- newRedeem w p a 0.0 (fundedFor i)
+        pure (p, req)
+      -- The inputs of an unfunded request are read after every funded
+      -- request has locked its shares.
+      items <- forA (zip reqs payers) $ \((p, (request, fundingAllocation)), vaultInputs) -> do
+        fundingInputs <- if isSome fundingAllocation then pure [] else shareInputs w p
+        pure (p, RedeemItem with request; fundingAllocation; fundingInputs; vaultInputs)
+      s <- executeRedeems w executor items
+      (st1, res) <- tryVault st s
+      let total = sum [ a | (_, _, a) <- asks ]
+          label = "redeems" <> show (length asks)
+          st2 = expect st1 label ok res $ \(x, dA, dS, flow) ->
+            if x.outputs /= outs then Some ("paid " <> show x.outputs <> ", predicted " <> show outs)
+            else if (dA, dS, flow) /= (negate (sum outs), negate total, negate (sum outs)) then Some ("moved " <> show (dA, dS, flow))
+            else None
+          st3 = if isSome res then (st2 with outs = foldl (\m ((p, _, _), o) -> Map.insertWith (+) p o m) st2.outs (zip asks outs)) else st2
+      pure st3 with pending = st3.pending ++ (if isSome res then [] else [ (p, PendingRedeem i.request) | (p, i) <- items ])
+
+-- | The vault account's unlocked holdings, with their amounts.
+vaultHoldings : World -> Script [(ContractId V2.Holding, Decimal)]
+vaultHoldings w = do
+  cids <- underlyingHoldings w.underlying w.operator
+  amounts <- accountHoldings w.underlying (basicAccount w.operator)
+  pure [ (cid, a) | (cid, a) <- amounts, cid `elem` cids ]
+
+-- | Disjoint sets of holdings for successive payments, each covering its
+-- amount (at least one holding even for a zero amount), for the longest
+-- prefix of payments that the holdings cover.
+assignHoldings : [(ContractId V2.Holding, Decimal)] -> [Decimal] -> [[ContractId V2.Holding]]
+assignHoldings _ [] = []
+assignHoldings pool (amount :: rest) = case cover pool amount 0.0 [] of
+  None -> []
+  Some (taken, left) -> taken :: assignHoldings left rest
+
+cover : [(ContractId V2.Holding, Decimal)] -> Decimal -> Decimal -> [ContractId V2.Holding] -> Optional ([ContractId V2.Holding], [(ContractId V2.Holding, Decimal)])
+cover pool amount got taken
+  | not (null taken) && got >= amount = Some (reverse taken, pool)
+  | otherwise = case pool of
+      [] -> None
+      (cid, a) :: more -> cover more amount (got + a) (cid :: taken)
+
+-- | Cancel a request that a refused execution left active, or a new
+-- unfunded deposit request; in both cases it is gone afterwards. A funded
+-- request's committed allocation stays locked until its deadline.
+cancel : SeqState -> Int -> Script SeqState
+cancel st r = do
+  let w = st.w
+  case st.pending of
+    (p, PendingDeposit req) :: rest -> do
+      run =<< cancelDeposit w p req []
+      gone p (coerceContractId req) (st with pending = rest)
+    (p, PendingRedeem req) :: rest -> do
+      run =<< cancelRedeem w p req []
+      gone p (coerceContractId req) (st with pending = rest)
+    [] -> do
+      let p = w.requesters !! (r % length w.requesters)
+      (req, _) <- newDeposit w p 1.0 0.0 False
+      run =<< cancelDeposit w p req []
+      gone p (coerceContractId req) st
+  where
+    gone p (cid : ContractId DepositRequest) st' = do
+      found <- queryContractId p cid
+      found' <- queryContractId p (coerceContractId cid : ContractId RedeemRequest)
+      pure $ if isNone found && isNone found' then record st' "cancel" else violate st' "cancel: the request is still active"
+
+-- Pause, asset additions, donations
+------------------------------------
+
+-- | Pause or unpause; one time in four, the redundant one, which is refused
+-- and leaves the vault unchanged.
+togglePause : SeqState -> Int -> Script SeqState
+togglePause st r = do
+  (_, v) <- vaultOf st.w
+  let redundant = (r / 3) % 4 == 0
+      pausing = v.paused == redundant
+  s <- if pausing then pause st.w else unpause st.w
+  res <- attempt s
+  (_, after) <- vaultOf st.w
+  let label = (if pausing then "pause" else "unpause") <> (if redundant then "-refused" else "")
+  pure $ case res of
+    Right _ | not redundant && after == (v with paused = pausing) -> record st label
+    Left _ | redundant && after == v -> record st label
+    _ -> violate st (label <> ": unexpected outcome")
+
+-- | `Vault_AddAssets` of the sponsor's underlying.
+addAssetsStep : SeqState -> Int -> Script SeqState
+addAssetsStep st r = do
+  let w = st.w
+  (_, v) <- vaultOf w
+  let amount = scaled (r / 3)
+      ok = not v.paused && v.totalShares > 0.0
+  s <- addAssets w amount
+  (st1, res) <- tryVault st s
+  let st2 = expect st1 "add" ok res $ \(_, dA, dS, flow) ->
+        if (dA, dS, flow) /= (amount, 0.0, amount) then Some ("moved " <> show (dA, dS, flow)) else None
+  pure $ if isSome res then (st2 with yieldAdded = True) else st2
+
+-- | V-05: underlying sent straight to the vault account, outside any vault
+-- choice, leaves the vault state and every conversion unchanged.
+donate : SeqState -> Int -> Script SeqState
+donate st r = do
+  let w = st.w
+  (_, before) <- vaultOf w
+  let samples = previews (viewOf before)
+  let amount = scaled (r / 3)
+  mintUnderlying w.underlying w.operator amount
+  (_, after) <- vaultOf w
+  pure $ if after == before && previews (viewOf after) == samples
+    then record (st with donated = st.donated + amount) "donate" else violate st "V-05: a donation changed the vault or a conversion"
+
+-- | All six conversions at sample amounts within their bounds.
+previews : VaultView -> [Decimal]
+previews v =
+  [ f v x | f <- [convertToShares, previewDeposit], x <- assetSamples v ]
+  ++ [ f v x | f <- [convertToAssets, previewMint, previewRedeem], x <- shareSamples v ]
+  ++ [ previewWithdraw v x | x <- assetSamples v, x <= v.totalAssets ]
+
+assetSamples : VaultView -> [Decimal]
+assetSamples v = [unit, 1.0, v.totalAssets, mulDiv Floor v.totalAssets 1.0 3.0]
+
+shareSamples : VaultView -> [Decimal]
+shareSamples v = [ x | x <- [unit, 1.0, v.totalShares, mulDiv Floor v.totalShares 1.0 3.0], x <= v.totalShares ]
+
+-- Invariants
+-------------
+
+-- | I-01, I-02, I-07, I-08, K-01, V-01, V-02 and V-03 on the current
+-- state, and the vault account's custody: the journal plus the donations.
+-- I-03 to I-06 and V-04 are checked by each operation.
+invariants : SeqState -> Script SeqState
+invariants st0 = if isSome st0.violation then pure st0 else do
+  let st = st0 with checks = st0.checks + 1
+      w = st.w
+  (_, v) <- vaultOf w
+  rec <- reconcile w st.journal
+  let k = v.decimalsOffset
+      a = v.totalAssets
+      s = v.totalShares
+      vs = virtualShares k
+      vw = viewOf v
+      bounds = a >= 0.0 && s >= 0.0 && a + unit <= assetCap k && s + vs <= shareCap k
+      k01 = s + vs <= mulDiv Floor (a + unit) vs unit
+      v01 = and [ previewRedeem vw (previewDeposit vw x) <= x | x <- assetSamples vw ]
+      v02 = and [ previewWithdraw vw x >= convertToShares vw x | x <- assetSamples vw, x <= a ]
+        && and [ previewMint vw x >= convertToAssets vw x | x <- shareSamples vw ]
+  if rec.recordedAssets /= rec.journalAssets then pure (violate st ("I-01: " <> show rec))
+  else if rec.custody /= rec.journalAssets + st.donated then pure (violate st ("custody: " <> show rec <> ", donated " <> show st.donated))
+  else if rec.recordedShares /= rec.shareSupply then pure (violate st ("I-02: " <> show rec))
+  else if (v with totalAssets = 0.0; totalShares = 0.0; paused = False) /= st.initial then pure (violate st "I-07: an identity field changed")
+  else if not bounds then pure (violate st ("I-08: " <> show (a, s)))
+  else if not k01 then pure (violate st ("K-01: " <> show (a, s)))
+  else if not v01 then pure (violate st "V-01")
+  else if not v02 then pure (violate st "V-02")
+  else v03 st
+
+-- | V-03, in a sequence of one requester with no yield added: what the
+-- requester took out, plus what its remaining shares redeem for, is at most
+-- what it put in.
+v03 : SeqState -> Script SeqState
+v03 st = case st.w.requesters of
+  [p] | not st.yieldAdded -> do
+    (_, v) <- vaultOf st.w
+    (held, locked) <- S.balanceOf st.w.shares p
+    let putIn = fromOptional 0.0 (Map.lookup p st.ins)
+        tookOut = fromOptional 0.0 (Map.lookup p st.outs)
+        remaining = previewRedeem (viewOf v) (held + locked)
+    pure $ if tookOut + remaining <= putIn then st
+      else violate st ("V-03: in " <> show putIn <> ", out " <> show tookOut <> ", remaining " <> show remaining)
+  _ -> pure st

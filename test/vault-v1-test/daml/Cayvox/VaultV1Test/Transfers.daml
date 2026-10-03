@@ -1,0 +1,400 @@
+-- | Share registry tests: transfers and holdings
+-- (`docs/REGISTRY-MUSTS.md`, sections 1 and 2).
+module Cayvox.VaultV1Test.Transfers where
+
+import DA.Assert ((===))
+import DA.Optional (isNone, isSome)
+import DA.Time (addRelTime, microseconds, seconds)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard
+import Cayvox.VaultV1Test.Setup
+
+withShares : Text -> Decimal -> Script (Registry, Party, Party, ContractId Holding)
+withShares tag amount = do
+  reg <- setupRegistry tag
+  alice <- allocateParty ("alice-" <> tag)
+  bob <- allocateParty ("bob-" <> tag)
+  h <- mintShares reg alice amount tag
+  pure (reg, alice, bob, h)
+
+-- | A pending transfer of `amount` from Alice to Bob.
+pending : Registry -> Party -> Party -> ContractId Holding -> Decimal -> Script (ContractId TransferInstruction)
+pending reg alice bob h amount = do
+  res <- tryTransfer reg [alice] (basicAccount alice) (basicAccount bob) amount [h] (seconds 60)
+  case res of
+    Right TransferInstructionResult {output = TransferInstructionResult_Pending {transferInstructionCid}} -> pure transferInstructionCid
+    _ -> abort ("transfer not pending: " <> show res)
+
+-- | A transfer with the receiver among the actors completes in one step
+-- (RM-13), archives all inputs (RM-10) and returns change.
+test_transfer_completesInOneStepWithReceiver : Script ()
+test_transfer_completesInOneStepWithReceiver = do
+  (reg, alice, bob, h) <- withShares "one-step" 10.0
+  res <- tryTransfer reg [alice, bob] (basicAccount alice) (basicAccount bob) 4.0 [h] (seconds 60)
+  case res of
+    Right TransferInstructionResult {output = TransferInstructionResult_Completed {}, senderChangeCids = [_]} -> pure ()
+    _ -> abort ("not completed: " <> show res)
+  assertArchived alice (fromInterfaceContractId @ShareHolding h)
+  a <- balanceOf reg alice
+  b <- balanceOf reg bob
+  (a, b) === ((6.0, 0.0), (4.0, 0.0))
+
+-- | Without the receiver the transfer is pending and the shares are locked;
+-- the receiver accepts, and the instruction is archived (RM-15).
+test_acceptTransfer_archivesInstruction : Script ()
+test_acceptTransfer_archivesInstruction = do
+  (reg, alice, bob, h) <- withShares "accept" 10.0
+  instr <- pending reg alice bob h 4.0
+  balanceOf reg alice >>= (=== (6.0, 4.0))
+  _ <- submit bob $ exerciseCmd instr TransferInstruction_Accept with actors = [bob]; extraArgs = noArgs
+  assertArchived alice (fromInterfaceContractId @ShareTransferInstruction instr)
+  a <- balanceOf reg alice
+  b <- balanceOf reg bob
+  (a, b) === ((6.0, 0.0), (4.0, 0.0))
+
+-- | Only the receiver's owner, alone or with its provider, accepts (RM-17).
+test_acceptTransfer_failsForUnauthorizedActors : Script ()
+test_acceptTransfer_failsForUnauthorizedActors = do
+  (reg, alice, bob, h) <- withShares "accept-actors" 10.0
+  instr <- pending reg alice bob h 4.0
+  trySubmit alice (exerciseCmd instr TransferInstruction_Accept with actors = [alice]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  trySubmit (actAs [alice, bob]) (exerciseCmd instr TransferInstruction_Accept with actors = [alice, bob]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  _ <- submit bob $ exerciseCmd instr TransferInstruction_Accept with actors = [bob]; extraArgs = noArgs
+  pure ()
+
+-- | The receiver's provider cannot accept alone (RM-17).
+test_acceptTransfer_providerAloneCannotAccept : Script ()
+test_acceptTransfer_providerAloneCannotAccept = do
+  (reg, alice, bob, h) <- withShares "accept-prov" 10.0
+  prov <- allocateParty "provider-accept"
+  let bobAcct = Account with owner = Some bob; provider = Some prov; id = ""
+  res <- tryTransfer reg [alice] (basicAccount alice) bobAcct 4.0 [h] (seconds 60)
+  instr <- case res of
+    Right TransferInstructionResult {output = TransferInstructionResult_Pending {transferInstructionCid}} -> pure transferInstructionCid
+    _ -> abort (show res)
+  trySubmit prov (exerciseCmd instr TransferInstruction_Accept with actors = [prov]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  _ <- submit (actAs [bob, prov]) $ exerciseCmd instr TransferInstruction_Accept with actors = [bob, prov]; extraArgs = noArgs
+  pure ()
+
+-- | Acceptance succeeds one unit before `executeBefore` and fails at it
+-- (RM-08).
+test_acceptTransfer_failsAtExecuteBefore : Script ()
+test_acceptTransfer_failsAtExecuteBefore = do
+  (reg, alice, bob, h) <- withShares "accept-deadline" 10.0
+  now <- getTime
+  first <- pending reg alice bob h 4.0
+  h2 <- largestUnlocked reg alice
+  second <- pending reg alice bob h2 4.0
+  let accept instr = trySubmit bob (exerciseCmd instr TransferInstruction_Accept with actors = [bob]; extraArgs = noArgs)
+  setTime (addRelTime now (seconds 60 - microseconds 1))
+  accept first >>= either (abort . show) (const (pure ()))
+  setTime (addRelTime now (seconds 60))
+  accept second >>= assertFails (registry "deadline-passed")
+
+-- | The receiver rejects: the shares return to the sender (RM-15, RM-18).
+test_rejectTransfer_returnsHoldingToSender : Script ()
+test_rejectTransfer_returnsHoldingToSender = do
+  (reg, alice, bob, h) <- withShares "reject" 10.0
+  instr <- pending reg alice bob h 4.0
+  res <- submit bob $ exerciseCmd instr TransferInstruction_Reject with actors = [bob]; extraArgs = noArgs
+  res.output === TransferInstructionResult_Failed
+  assertArchived alice (fromInterfaceContractId @ShareTransferInstruction instr)
+  balanceOf reg alice >>= (=== (10.0, 0.0))
+
+-- | Only the receiver's parties reject (RM-18).
+test_rejectTransfer_failsForUnauthorizedActors : Script ()
+test_rejectTransfer_failsForUnauthorizedActors = do
+  (reg, alice, bob, h) <- withShares "reject-actors" 10.0
+  instr <- pending reg alice bob h 4.0
+  trySubmit alice (exerciseCmd instr TransferInstruction_Reject with actors = [alice]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  trySubmit (actAs [alice, bob]) (exerciseCmd instr TransferInstruction_Reject with actors = [alice, bob]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  _ <- submit bob $ exerciseCmd instr TransferInstruction_Reject with actors = [bob]; extraArgs = noArgs
+  pure ()
+
+-- | The receiver's provider may reject alone (RM-18).
+test_rejectTransfer_byReceiverProvider : Script ()
+test_rejectTransfer_byReceiverProvider = do
+  (reg, alice, bob, h) <- withShares "reject-prov" 10.0
+  prov <- allocateParty "provider-reject"
+  let bobAcct = Account with owner = Some bob; provider = Some prov; id = ""
+  res <- tryTransfer reg [alice] (basicAccount alice) bobAcct 4.0 [h] (seconds 60)
+  instr <- case res of
+    Right TransferInstructionResult {output = TransferInstructionResult_Pending {transferInstructionCid}} -> pure transferInstructionCid
+    _ -> abort (show res)
+  _ <- submit prov $ exerciseCmd instr TransferInstruction_Reject with actors = [prov]; extraArgs = noArgs
+  balanceOf reg alice >>= (=== (10.0, 0.0))
+
+-- | The sender withdraws: the shares return (RM-15, RM-19).
+test_withdrawTransfer_returnsHoldingToSender : Script ()
+test_withdrawTransfer_returnsHoldingToSender = do
+  (reg, alice, bob, h) <- withShares "twithdraw" 10.0
+  instr <- pending reg alice bob h 4.0
+  res <- submit alice $ exerciseCmd instr TransferInstruction_Withdraw with actors = [alice]; extraArgs = noArgs
+  res.output === TransferInstructionResult_Failed
+  assertArchived alice (fromInterfaceContractId @ShareTransferInstruction instr)
+  balanceOf reg alice >>= (=== (10.0, 0.0))
+
+-- | Only the sender's parties withdraw (RM-19).
+test_withdrawTransfer_failsForUnauthorizedActors : Script ()
+test_withdrawTransfer_failsForUnauthorizedActors = do
+  (reg, alice, bob, h) <- withShares "twithdraw-actors" 10.0
+  instr <- pending reg alice bob h 4.0
+  trySubmit bob (exerciseCmd instr TransferInstruction_Withdraw with actors = [bob]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  trySubmit (actAs [alice, bob]) (exerciseCmd instr TransferInstruction_Withdraw with actors = [alice, bob]; extraArgs = noArgs)
+    >>= assertFails (registry "unauthorized-actors")
+  _ <- submit alice $ exerciseCmd instr TransferInstruction_Withdraw with actors = [alice]; extraArgs = noArgs
+  pure ()
+
+-- | The sender's provider may withdraw alone (RM-19).
+test_withdrawTransfer_bySenderProvider : Script ()
+test_withdrawTransfer_bySenderProvider = do
+  reg <- setupRegistry "twithdraw-prov"
+  alice <- allocateParty "alice-twithdraw-prov"
+  prov <- allocateParty "provider-twithdraw"
+  bob <- allocateParty "bob-twithdraw-prov"
+  let aliceAcct = Account with owner = Some alice; provider = Some prov; id = ""
+      settlement = settlementOf reg "mint"
+      leg = shareLeg reg "m" mintAccount aliceAcct 10.0
+  (m, _) <- allocate reg [reg.operator] settlement (specOf reg mintAccount [senderSide leg] None False) []
+  (r, _) <- allocate reg [alice] settlement (specOf reg aliceAcct [receiverSide leg] None False) []
+  _ <- settle reg settlement [leg] [m, r]
+  [(h, _)] <- holdingsOf reg alice
+  res <- tryTransfer reg [alice] aliceAcct (basicAccount bob) 4.0 [toInterfaceContractId h] (seconds 60)
+  instr <- case res of
+    Right TransferInstructionResult {output = TransferInstructionResult_Pending {transferInstructionCid}} -> pure transferInstructionCid
+    _ -> abort (show res)
+  _ <- submit prov $ exerciseCmd instr TransferInstruction_Withdraw with actors = [prov]; extraArgs = noArgs
+  balanceOf reg alice >>= (=== (10.0, 0.0))
+
+-- | The pending instruction's view (RM-20).
+test_transfer_pendingInstructionView : Script ()
+test_transfer_pendingInstructionView = do
+  (reg, alice, bob, h) <- withShares "tview" 10.0
+  instr <- pending reg alice bob h 4.0
+  Some v <- queryInterfaceContractId bob instr
+  v.expiresAt === Some v.transfer.executeBefore
+  check "originalInstructionCid is set" (isNone v.originalInstructionCid)
+
+-- Transfer guards, in the order of `transferImpl` (RM-06 to RM-12). Each
+-- test fails one guard, then shows that the valid transfer is accepted.
+------------------------------------------------------------------------
+
+-- | Alice's shares, Bob, the rules disclosure, a valid transfer of 4.0 and a
+-- submitter of `TransferFactory_Transfer`.
+data TransferFixture = TransferFixture with
+  reg : Registry
+  alice : Party
+  bob : Party
+  now : Time
+  base : Transfer
+  attempt : [Party] -> Transfer -> Script (Either SubmitError TransferInstructionResult)
+
+transferFixture : Text -> Script TransferFixture
+transferFixture tag = do
+  (reg, alice, bob, h) <- withShares tag 10.0
+  now <- getTime
+  d <- rulesDisclosure reg
+  let base = Transfer with
+        sender = basicAccount alice; receiver = basicAccount bob; amount = 4.0
+        instrumentId = reg.instrument; requestedAt = now; executeBefore = addRelTime now (seconds 60)
+        inputHoldingCids = [h]; meta = emptyMetadata
+      attempt actors t = trySubmit (actAs actors <> disclose d) $
+        exerciseCmd (toInterfaceContractId @TransferFactory reg.rules) TransferFactory_Transfer with
+          transfer = t; actors; extraArgs = noArgs
+  pure TransferFixture with reg; alice; bob; now; base; attempt
+
+-- | The fixture's valid transfer is accepted.
+transferAccepted : TransferFixture -> Script ()
+transferAccepted f = f.attempt [f.alice] f.base >>= either (abort . show) (const (pure ()))
+
+-- | Another admin (RM-11).
+test_transfer_failsForAnotherAdmin : Script ()
+test_transfer_failsForAnotherAdmin = do
+  f <- transferFixture "t-admin"
+  f.attempt [f.alice] (f.base with instrumentId = (f.reg.instrument with admin = f.bob)) >>= assertFails (registry "wrong-admin")
+  transferAccepted f
+
+-- | Another instrument of the same admin (RM-11).
+test_transfer_failsForAnotherInstrument : Script ()
+test_transfer_failsForAnotherInstrument = do
+  f <- transferFixture "t-instr"
+  f.attempt [f.alice] (f.base with instrumentId = (f.reg.instrument with id = "other")) >>= assertFails (registry "wrong-instrument")
+  transferAccepted f
+
+-- | Special accounts and the operator's own account are not transfer
+-- accounts, on either side (RM-02).
+test_transfer_rejectsSpecialAccount : Script ()
+test_transfer_rejectsSpecialAccount = do
+  f <- transferFixture "t-special"
+  f.attempt [f.alice] (f.base with receiver = burnAccount) >>= assertFails (registry "invalid-account")
+  f.attempt [f.alice] (f.base with receiver = basicAccount f.reg.operator) >>= assertFails (registry "invalid-account")
+  f.attempt [f.alice] (f.base with sender = mintAccount) >>= assertFails (registry "invalid-account")
+  transferAccepted f
+
+-- | Actors without the sender's owner, or with an outsider (RM-12).
+test_transfer_failsForUnauthorizedActors : Script ()
+test_transfer_failsForUnauthorizedActors = do
+  f <- transferFixture "t-actors"
+  f.attempt [f.bob] f.base >>= assertFails (registry "unauthorized-actors")
+  outsider <- allocateParty "outsider-t-actors"
+  f.attempt [f.alice, outsider] f.base >>= assertFails (registry "unauthorized-actors")
+  transferAccepted f
+
+-- | A non-positive amount.
+test_transfer_rejectsNonPositiveAmount : Script ()
+test_transfer_rejectsNonPositiveAmount = do
+  f <- transferFixture "t-amount"
+  f.attempt [f.alice] (f.base with amount = 0.0) >>= assertFails (registry "invalid-amount")
+  f.attempt [f.alice] (f.base with amount = -1.0) >>= assertFails (registry "invalid-amount")
+  transferAccepted f
+
+-- | `requestedAt` one unit in the future (RM-06).
+test_transfer_failsWhenRequestedInFuture : Script ()
+test_transfer_failsWhenRequestedInFuture = do
+  f <- transferFixture "t-requested"
+  f.attempt [f.alice] (f.base with requestedAt = addRelTime f.now (microseconds 1)) >>= assertFails (registry "not-yet-requested")
+  transferAccepted f
+
+-- | `executeBefore` at the ledger time fails; one unit later is accepted (RM-07).
+test_transfer_failsWhenExecuteBeforeReached : Script ()
+test_transfer_failsWhenExecuteBeforeReached = do
+  f <- transferFixture "t-execute"
+  f.attempt [f.alice] (f.base with executeBefore = f.now) >>= assertFails (registry "deadline-passed")
+  f.attempt [f.alice] (f.base with executeBefore = addRelTime f.now (microseconds 1)) >>= either (abort . show) (const (pure ()))
+
+-- | An input holding of another account, disclosed to Alice (RM-09).
+test_transfer_rejectsInputOfAnotherAccount : Script ()
+test_transfer_rejectsInputOfAnotherAccount = do
+  f <- transferFixture "t-input"
+  bh <- mintShares f.reg f.bob 5.0 "t-input-bob"
+  Some bd <- queryDisclosure f.bob (fromInterfaceContractId @ShareHolding bh)
+  d <- rulesDisclosure f.reg
+  trySubmit (actAs f.alice <> discloseMany [d, bd]) (exerciseCmd (toInterfaceContractId @TransferFactory f.reg.rules)
+    TransferFactory_Transfer with transfer = (f.base with inputHoldingCids = [bh]); actors = [f.alice]; extraArgs = noArgs)
+    >>= assertFails (registry "invalid-input-holding")
+  transferAccepted f
+
+-- | An input holding of another instrument of the same operator, in
+-- Alice's account (RM-09).
+test_transfer_rejectsInputOfAnotherInstrument : Script ()
+test_transfer_rejectsInputOfAnotherInstrument = do
+  f <- transferFixture "t-input-instr"
+  other <- otherInstrument f.reg
+  oh <- mintShares other f.alice 5.0 "t-input-instr-other"
+  f.attempt [f.alice] (f.base with inputHoldingCids = [oh]) >>= assertFails (registry "invalid-input-holding")
+  transferAccepted f
+
+-- | Inputs that do not cover the amount, and no input at all.
+test_transfer_failsForInsufficientFunds : Script ()
+test_transfer_failsForInsufficientFunds = do
+  f <- transferFixture "t-funds"
+  f.attempt [f.alice] (f.base with amount = 10.0000000001) >>= assertFails (registry "insufficient-funds")
+  f.attempt [f.alice] (f.base with inputHoldingCids = []) >>= assertFails (registry "insufficient-funds")
+  f.attempt [f.alice] (f.base with amount = 10.0) >>= either (abort . show) (const (pure ()))
+
+-- | All inputs are archived, including more than needed (RM-10).
+test_transfer_archivesAllInputs : Script ()
+test_transfer_archivesAllInputs = do
+  (reg, alice, bob, h1) <- withShares "archive-all" 10.0
+  h2 <- mintShares reg alice 5.0 "archive-all-2"
+  _ <- tryTransfer reg [alice, bob] (basicAccount alice) (basicAccount bob) 3.0 [h1, h2] (seconds 60) >>= either (abort . show) pure
+  assertArchived alice (fromInterfaceContractId @ShareHolding h1)
+  assertArchived alice (fromInterfaceContractId @ShareHolding h2)
+  balanceOf reg alice >>= (=== (12.0, 0.0))
+
+-- | A locked holding cannot fund a transfer; the lock predicate accepts an
+-- expired lock (RM-04).
+test_transfer_rejectsLockedHolding : Script ()
+test_transfer_rejectsLockedHolding = do
+  (reg, alice, bob, h) <- withShares "locked" 10.0
+  _ <- pending reg alice bob h 4.0
+  [(locked, _)] <- filter (\(_, x) -> isSome x.lock) <$> holdingsOf reg alice
+  tryTransfer reg [alice] (basicAccount alice) (basicAccount bob) 1.0 [toInterfaceContractId locked] (seconds 60)
+    >>= assertFails (registry "invalid-input-holding")
+
+test_transfer_acceptsHoldingWithExpiredLock : Script ()
+test_transfer_acceptsHoldingWithExpiredLock = do
+  operator <- allocateParty "operator-expired"
+  alice <- allocateParty "alice-expired"
+  now <- getTime
+  let lockAt t = Lock with holders = [operator]; expiresAt = t; expiresAfter = None; context = None
+      holding l = ShareHolding with
+        admin = operator; instrumentId = InstrumentId with admin = operator; id = "v"
+        account = basicAccount alice; amount = 1.0; lock = l; lockObservers = []; meta = emptyMetadata
+  check "unlocked" (inputHoldingUsable now (holding None))
+  check "expired at now" (inputHoldingUsable now (holding (Some (lockAt (Some now)))))
+  check "not yet expired" (not (inputHoldingUsable now (holding (Some (lockAt (Some (addRelTime now (microseconds 1))))))))
+  check "no expiry" (not (inputHoldingUsable now (holding (Some (lockAt None)))))
+
+-- | A provider alone cannot instruct a transfer (RM-14).
+test_transfer_providerAloneCannotInstruct : Script ()
+test_transfer_providerAloneCannotInstruct = do
+  (reg, alice, bob, h) <- withShares "tprov" 10.0
+  prov <- allocateParty "provider-tprov"
+  let acct = Account with owner = Some alice; provider = Some prov; id = ""
+  tryTransfer reg [prov] acct (basicAccount bob) 1.0 [h] (seconds 60) >>= assertFails (registry "unauthorized-actors")
+
+-- | Holdings: the operator's account and accounts without an owner are
+-- rejected (RM-02, T-13).
+test_holding_rejectsAccountWithoutOwner : Script ()
+test_holding_rejectsAccountWithoutOwner = do
+  reg <- setupRegistry "hold-owner"
+  alice <- allocateParty "alice-hold-owner"
+  let holding account = ShareHolding with
+        admin = reg.operator; instrumentId = reg.instrument; account; amount = 1.0; lock = None; lockObservers = []; meta = emptyMetadata
+  trySubmit (actAs [reg.operator, alice]) (createCmd (holding mintAccount)) >>= assertFails PreconditionViolated
+  trySubmit reg.operator (createCmd (holding (basicAccount reg.operator))) >>= assertFails PreconditionViolated
+
+-- | The factory's instrument is administered by its signatory (RM-01).
+test_shareRules_requiresOwnAdmin : Script ()
+test_shareRules_requiresOwnAdmin = do
+  operator <- allocateParty "operator-rules"
+  other <- allocateParty "other-rules"
+  trySubmit operator (createCmd ShareRules with
+    admin = operator; instrumentId = (InstrumentId with admin = other; id = "v"); meta = emptyMetadata)
+    >>= assertFails PreconditionViolated
+  trySubmit operator (createCmd ShareRules with
+    admin = operator; instrumentId = (InstrumentId with admin = operator; id = ""); meta = emptyMetadata)
+    >>= assertFails PreconditionViolated
+
+-- | The factories' public fetch choices return their views.
+test_shareRules_publicFetch : Script ()
+test_shareRules_publicFetch = do
+  reg <- setupRegistry "fetch"
+  alice <- allocateParty "alice-fetch"
+  d <- rulesDisclosure reg
+  av <- submit (actAs alice <> disclose d) $ exerciseCmd (toInterfaceContractId @AllocationFactory reg.rules) AllocationFactory_PublicFetch with actors = [alice]
+  sv <- submit (actAs alice <> disclose d) $ exerciseCmd (toInterfaceContractId @SettlementFactory reg.rules) SettlementFactory_PublicFetch with actors = [alice]
+  tv <- submit (actAs alice <> disclose d) $ exerciseCmd (toInterfaceContractId @TransferFactory reg.rules) TransferFactory_PublicFetch with actors = [alice]
+  (av.admin, sv.admin, tv.admin) === (reg.operator, reg.operator, reg.operator)
+
+-- | The operator can archive its rules contract, which ends new allocations
+-- and transfers; existing holdings and allocations stay active.
+test_shareRules_archiveEndsNewOperations : Script ()
+test_shareRules_archiveEndsNewOperations = do
+  (reg, alice, bob, h) <- withShares "rules-archive" 10.0
+  submit reg.operator $ archiveCmd reg.rules
+  assertArchived reg.operator reg.rules
+  now <- getTime
+  trySubmit reg.operator (exerciseCmd (toInterfaceContractId @TransferFactory reg.rules) TransferFactory_Transfer with
+    transfer = Transfer with
+      sender = basicAccount alice; receiver = basicAccount bob; amount = 1.0; instrumentId = reg.instrument
+      requestedAt = now; executeBefore = addRelTime now (seconds 60); inputHoldingCids = [h]; meta = emptyMetadata
+    actors = [reg.operator]; extraArgs = noArgs)
+    >>= assertFails (ContractUnavailable (show (toInterfaceContractId @TransferFactory reg.rules)))
+  assertActive alice (fromInterfaceContractId @ShareHolding h)

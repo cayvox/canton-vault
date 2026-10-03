@@ -1,0 +1,164 @@
+-- | The failure helper (`docs/TESTING.md`, section 3, rule 2): asserts the
+-- exact shape of a failed submission, and whether a contract is active,
+-- archived or not visible, identically on the in-memory IDE ledger and on a
+-- Canton ledger over the Ledger API. It uses only the public `Daml.Script`
+-- module, so it passes `damlc lint` (gate Q-10).
+--
+-- The same failure reaches a script in different `SubmitError` shapes
+-- (daml-script `Daml/Script/Internal/Questions/Submit/Error.daml`):
+--
+-- * A `failWithStatus` failure is `FailureStatusError` with the whole
+--   `FailureStatus`, unless the error body does not fit into the Ledger API
+--   response; then it is `TruncatedError` of type `"FailureStatusError"`
+--   whose message carries `User failure: <errorId> (error category <n>)`.
+-- * An unhandled exception raised with `fail`, `error`, `assertMsg` or
+--   Splice's `require'` is the same, with `errorId`
+--   `UNHANDLED_EXCEPTION/<module>:<exception>`.
+-- * A missing authorization is `AuthorizationError`.
+-- * A contract that the submitters cannot see, or that was archived, is
+--   `ContractNotFound` naming it.
+-- * A contract of another template than the one fetched or exercised is
+--   `WronglyTypedContract` naming it.
+-- * A create whose `ensure` fails is an unhandled `PreconditionFailed`, with
+--   `errorId` `UNHANDLED_EXCEPTION/DA.Exception.PreconditionFailed:PreconditionFailed`
+--   (`test/vault-v1-test`, `test_vaultState_totalsAndOffset`).
+-- * A disclosure of a contract archived before the transaction is confirmed
+--   is `ContractNotFound` naming it on the IDE ledger. On Canton it is
+--   `UnknownError` with `LOCAL_VERDICT_INACTIVE_CONTRACTS`, whose message
+--   names no contract: only the participant log does.
+--
+-- Whether a `ContractNotFound` means "never visible" or "archived" is carried
+-- only by debugging information that daml-script reads through
+-- `Daml.Script.Internal`, and Canton never sets it. The helper therefore
+-- matches both as `ContractUnavailable`, and asserts archival separately with
+-- `assertArchived`: a stakeholder that saw the contract active
+-- (`assertActive`) no longer finds it ([`queryContractId`](https://github.com/digital-asset/daml/blob/de513339189206e5bcae77b2cfc68afda9b05ef5/sdk/daml-script/daml/Daml/Script/Internal/Questions/Query.daml#L57)).
+module Cayvox.Testing.Assert
+  ( Expected (..)
+  , matches
+  , assertFails
+  , categoryCode
+  , generalError
+  , assertionFailed
+  , preconditionFailed
+  , assertActive
+  , assertArchived
+  , assertNotVisible
+  ) where
+
+import DA.Fail (FailureCategory (..))
+import DA.NonEmpty (toList)
+import DA.Optional (isNone, isSome)
+import qualified DA.Text as T
+import Daml.Script
+
+-- | The expected shape of a failed submission.
+data Expected
+  = Status with
+      errorId : Text
+      category : FailureCategory
+    -- ^ A `failWithStatus` failure, or an unhandled exception through its
+    -- `UNHANDLED_EXCEPTION/...` identifier, matched on the exact identifier
+    -- and category.
+  | Authorization
+    -- ^ A missing authorization.
+  | ContractUnavailable with
+      contractId : Text
+    -- ^ The contract, given by `show cid`, is not visible to the submitters
+    -- or was archived: `ContractNotFound` naming it.
+  | WrongTemplate with
+      contractId : Text
+    -- ^ The contract, given by `show cid`, is of another template than the
+    -- one the submission fetched or exercised.
+  | PreconditionViolated
+    -- ^ A created contract's `ensure` clause does not hold.
+  | StaleDisclosure with
+      contractId : Text
+    -- ^ A disclosure of the contract, given by `show cid`, was archived
+    -- before confirmation. On Canton the rejection names no contract, so
+    -- there the helper matches any `LOCAL_VERDICT_INACTIVE_CONTRACTS`.
+  deriving (Eq, Show)
+
+-- | The `errorId` of an unhandled `GeneralError`, as raised by `fail` and by
+-- Splice's `require'`.
+generalError : Text
+generalError = "UNHANDLED_EXCEPTION/DA.Exception.GeneralError:GeneralError"
+
+-- | The `errorId` of an unhandled `AssertionFailed`, as raised by
+-- `assertMsg`.
+assertionFailed : Text
+assertionFailed = "UNHANDLED_EXCEPTION/DA.Exception.AssertionFailed:AssertionFailed"
+
+-- | The `errorId` of an unhandled `PreconditionFailed`, as raised by a create
+-- whose `ensure` clause does not hold.
+preconditionFailed : Text
+preconditionFailed = "UNHANDLED_EXCEPTION/DA.Exception.PreconditionFailed:PreconditionFailed"
+
+-- | The Canton error category code of a failure category, as it appears in a
+-- truncated error message ([`ErrorCategory.scala`](https://github.com/digital-asset/daml/blob/de513339189206e5bcae77b2cfc68afda9b05ef5/sdk/canton/base/errors/src/main/scala/com/digitalasset/base/error/ErrorCategory.scala#L257-L290)).
+categoryCode : FailureCategory -> Int
+categoryCode InvalidIndependentOfSystemState = 8
+categoryCode InvalidGivenCurrentSystemStateOther = 9
+
+-- | Whether a submission error has the expected shape.
+matches : Expected -> SubmitError -> Bool
+matches (Status {errorId, category}) err = case err of
+  FailureStatusError fs -> fs.errorId == errorId && fs.category == category
+  TruncatedError {truncatedErrorType, truncatedErrorMessage} ->
+    truncatedErrorType == "FailureStatusError" &&
+    T.isInfixOf ("User failure: " <> errorId <> " (error category " <> show (categoryCode category) <> ")")
+      truncatedErrorMessage
+  _ -> False
+matches Authorization err = case err of
+  AuthorizationError _ -> True
+  TruncatedError {truncatedErrorType} -> truncatedErrorType == "AuthorizationError"
+  _ -> False
+matches (ContractUnavailable cid) err = case err of
+  ContractNotFound {unknownContractIds} -> cid `elem` toList unknownContractIds
+  TruncatedError {truncatedErrorType, truncatedErrorMessage} ->
+    truncatedErrorType == "ContractNotFound" && T.isInfixOf cid truncatedErrorMessage
+  _ -> False
+matches (WrongTemplate cid) err = case err of
+  WronglyTypedContract {contractId} -> T.isInfixOf cid (show contractId) || T.isInfixOf (show contractId) cid
+  TruncatedError {truncatedErrorType, truncatedErrorMessage} ->
+    truncatedErrorType == "WronglyTypedContract" && T.isInfixOf cid truncatedErrorMessage
+  _ -> False
+matches PreconditionViolated err =
+  matches (Status preconditionFailed InvalidGivenCurrentSystemStateOther) err || case err of
+    TemplatePreconditionViolated -> True
+    _ -> False
+matches (StaleDisclosure cid) err = case err of
+  UnknownError msg -> T.isInfixOf "LOCAL_VERDICT_INACTIVE_CONTRACTS(11," msg
+  _ -> matches (ContractUnavailable cid) err
+
+-- | Assert that a submission failed with the expected shape.
+assertFails : Expected -> Either SubmitError a -> Script ()
+assertFails expected result = case result of
+  Right _ -> abort ("expected failure " <> show expected <> ", but the submission succeeded")
+  Left err
+    | matches expected err -> pure ()
+    | otherwise -> abort ("expected failure " <> show expected <> ", got " <> show err)
+
+-- | Assert that the contract is active and that the party, a stakeholder,
+-- sees it.
+assertActive : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+assertActive party cid = do
+  found <- queryContractId party cid
+  if isSome found then pure () else abort ("expected " <> show cid <> " to be active for " <> show party)
+
+-- | Assert that a stakeholder no longer finds the contract. `queryContractId`
+-- "Returns `None` if there is no active contract the party is a stakeholder
+-- on" (daml-script `Daml/Script/Internal/Questions/Query.daml:57`), so for a
+-- stakeholder for whom `assertActive` held before, this observes archival.
+assertArchived : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+assertArchived stakeholder cid = do
+  found <- queryContractId stakeholder cid
+  if isNone found then pure () else abort ("expected " <> show cid <> " to be archived")
+
+-- | Assert that the contract, active for the stakeholder, is not visible to
+-- the other party.
+assertNotVisible : (Template t, HasEnsure t) => Party -> Party -> ContractId t -> Script ()
+assertNotVisible stakeholder other cid = do
+  assertActive stakeholder cid
+  found <- queryContractId other cid
+  if isNone found then pure () else abort ("expected " <> show cid <> " not to be visible to " <> show other)

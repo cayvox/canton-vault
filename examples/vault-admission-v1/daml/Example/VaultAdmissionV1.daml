@@ -1,0 +1,127 @@
+-- | Example: a Permissioned vault behind an on-ledger admission check.
+--
+-- The operator keeps an `AdmissionDesk` for one vault: the parties whose
+-- deposits it executes. Its deposit choice reads every request and refuses
+-- the batch unless each requester, and the owner of each receiving account,
+-- is admitted, then executes it through `Vault_ExecuteDeposits`. Admission
+-- never blocks a redemption, also while the vault is paused (D-14). The
+-- pause flag is the vault's own, set with `Vault_Pause` and read through the
+-- `Vault` view.
+--
+-- The desk is the operator's policy aid, not a guarantee to anyone: the
+-- operator can also execute directly, and shares are transferable through
+-- the share registry, so admission governs who deposits, not who holds.
+--
+-- Never released or uploaded, like every example (`examples/README.md`).
+module Example.VaultAdmissionV1
+  ( AdmissionDesk (..)
+  , Desk_Admit (..)
+  , Desk_Remove (..)
+  , Desk_ExecuteDeposits (..)
+  , Desk_ExecuteRedeems (..)
+  , notAdmittedId
+  , wrongVaultId
+  ) where
+
+import DA.Action (unless)
+import DA.Fail (FailureCategory (..), failWithStatus, FailureStatus (..))
+import DA.Foldable (forA_)
+import DA.List (dedupSort)
+import qualified DA.Text as T
+import qualified DA.TextMap as TextMap
+
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+
+import Cayvox.VaultV1
+
+-- | The most parties a desk admits.
+maxAdmitted : Int
+maxAdmitted = 1000
+
+-- | The failure of a deposit by a party the desk has not admitted.
+notAdmittedId : Text
+notAdmittedId = "cayvox.com/example-not-admitted"
+
+notAdmitted : Party -> Update a
+notAdmitted p = failWithStatus FailureStatus with
+  errorId = notAdmittedId
+  category = InvalidGivenCurrentSystemStateOther
+  message = "requester " <> show p <> " is not admitted to this vault"
+  meta = TextMap.empty
+
+-- | The failure of a desk choice given another vault than its own.
+wrongVaultId : Text
+wrongVaultId = "cayvox.com/example-wrong-vault"
+
+wrongVault : Update a
+wrongVault = failWithStatus FailureStatus with
+  errorId = wrongVaultId
+  category = InvalidGivenCurrentSystemStateOther
+  message = "the vault is not this desk's vault"
+  meta = TextMap.empty
+
+-- | The operator's admission list for the vault `vaultId`.
+--
+-- * Signatory: the operator. No observers: requesters learn of their
+--   admission off-ledger.
+-- * `ensure`: the list is sorted without duplicates, holds at most
+--   `maxAdmitted` parties, and the vault identifier is bounded.
+-- * Choices: `Desk_Admit` and `Desk_Remove` change the list;
+--   `Desk_ExecuteDeposits` checks it and executes; `Desk_ExecuteRedeems`
+--   executes without a check. All controlled by the operator.
+template AdmissionDesk
+  with
+    operator : Party
+    vaultId : Text
+    admitted : [Party]
+  where
+    signatory operator
+    ensure admitted == dedupSort admitted && T.length vaultId <= 256 && length admitted <= maxAdmitted
+
+    choice Desk_Admit : ContractId AdmissionDesk
+      -- ^ Admit a party.
+      with
+        party : Party
+      controller operator
+      do create this with admitted = dedupSort (party :: admitted)
+
+    choice Desk_Remove : ContractId AdmissionDesk
+      -- ^ Remove a party; its pending requests are no longer executed.
+      with
+        party : Party
+      controller operator
+      do create this with admitted = filter (/= party) admitted
+
+    nonconsuming choice Desk_ExecuteDeposits : ExecResult
+      -- ^ The admission check, then the vault's deposit execution.
+      with
+        vault : ContractId VaultState
+        items : [DepositItem]
+        assetContext : ExtraArgs
+        shareContext : ExtraArgs
+      controller operator
+      do
+        v <- fetch vault
+        unless (v.operator == operator && v.vaultId == vaultId) $ wrongVault
+        forA_ items $ \i -> do
+          request <- fetch i.request
+          unless (request.requester `elem` admitted) $ notAdmitted request.requester
+          case request.receiver.owner of
+            Some owner | owner `elem` admitted -> pure ()
+            _ -> notAdmitted request.requester
+        exercise vault Vault_ExecuteDeposits with
+          executor = operator; items; assetContext; shareContext
+
+    nonconsuming choice Desk_ExecuteRedeems : ExecResult
+      -- ^ The vault's redemption execution, open to every holder.
+      with
+        vault : ContractId VaultState
+        items : [RedeemItem]
+        assetContext : ExtraArgs
+        shareContext : ExtraArgs
+      controller operator
+      do
+        v <- fetch vault
+        unless (v.operator == operator && v.vaultId == vaultId) $ wrongVault
+        exercise vault Vault_ExecuteRedeems with
+          executor = operator; items; assetContext; shareContext

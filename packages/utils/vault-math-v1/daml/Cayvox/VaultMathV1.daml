@@ -1,0 +1,42 @@
+-- | Cayvox vault math: `mulDiv`, the exact `a * b / c` rounded in the
+-- direction the caller chooses, over the whole non-negative `Decimal` range
+-- (`docs/MATH.md`).
+--
+-- The package is a utility package: it defines no templates, interfaces,
+-- exceptions or serializable public state (`docs/CONVENTIONS.md`, section 3).
+module Cayvox.VaultMathV1
+  ( Rounding (..)
+  , mulDiv
+  ) where
+
+import DA.Fail (failWithStatusPure)
+
+import Cayvox.VaultMathV1.Internal (mulDivChecked)
+
+-- | Direction of rounding. Results are non-negative, so `Floor` rounds
+-- toward zero and `Ceil` away from zero.
+data Rounding
+  = Floor
+    -- ^ The largest `Decimal` at or below the exact result.
+  | Ceil
+    -- ^ The smallest `Decimal` at or above the exact result.
+  deriving (Eq, Show)
+
+-- | `mulDiv r a b c` is the exact `a * b / c`, rounded in direction `r` to a
+-- `Decimal`. The product `a * b` is never rounded and never overflows on its
+-- own: only the final result must fit.
+--
+-- Failures, checked in this order, each with category
+-- `InvalidGivenCurrentSystemStateOther`:
+--
+-- * `cayvox.com/math-negative-operand` when `a < 0` or `b < 0`;
+-- * `cayvox.com/math-non-positive-divisor` when `c <= 0`;
+-- * `cayvox.com/math-overflow` when the rounded result exceeds the largest
+--   `Decimal`, `9999999999999999999999999999.9999999999`.
+--
+-- The function is pure and fails with `failWithStatusPure`. Evaluation is
+-- strict: a failing call bound by `let` fails the transaction even if its
+-- value is never used, so a caller that must not fail checks the conditions
+-- above first.
+mulDiv : Rounding -> Decimal -> Decimal -> Decimal -> Decimal
+mulDiv r a b c = either failWithStatusPure identity (mulDivChecked (r == Ceil) a b c)

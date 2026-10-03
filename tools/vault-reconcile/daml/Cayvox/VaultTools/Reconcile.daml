@@ -1,0 +1,112 @@
+-- | The reconciliation aid: a read-only Daml Script
+-- over the operator's view that compares a vault's recorded accounting with
+-- the ledger.
+--
+-- * I-01: `totalAssets` equals the journal, the underlying that vault
+--   choices moved into the vault account minus what they moved out.
+-- * I-02: `totalShares` equals the sum of every share holding.
+-- * Custody (`docs/SPEC.md` §8): the vault account holds the journal plus
+--   what entered it outside vault choices, the donations.
+-- * Identity, when a baseline is given: the fields that no vault choice
+--   changes are those of the baseline, so a vault state recreated with the
+--   same totals but another offset, account, mode, instrument or registry
+--   is reported.
+--
+-- The journal and the donations come from the operator's transaction
+-- stream: a vault choice's flow into and out of the vault account is part
+-- of the choice's transaction, and every other movement of the vault
+-- account is classified by the operator. The script reads only active
+-- contracts, through the operator's party: the vault state, every share
+-- holding of the vault's instrument, and the vault account's underlying
+-- holdings, all through the `Holding` interface of the token standard.
+-- It submits nothing.
+--
+-- Never released, and no production package depends on it.
+module Cayvox.VaultTools.Reconcile
+  ( ReconcileInput (..)
+  , Report (..)
+  , VaultIdentity (..)
+  , identityOf
+  , reconcile
+  ) where
+
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2 (Account, Holding, InstrumentId)
+
+import Cayvox.Api.VaultV1 (Mode)
+import Cayvox.VaultV1 (RegistryRef, VaultState (..))
+
+-- | The fields of a vault state that no vault choice changes.
+data VaultIdentity = VaultIdentity with
+    asset : InstrumentId
+    shareInstrument : InstrumentId
+    vaultAccount : Account
+    mode : Mode
+    decimalsOffset : Int
+    assetRegistry : RegistryRef
+    shareRegistry : RegistryRef
+  deriving (Eq, Show)
+
+identityOf : VaultState -> VaultIdentity
+identityOf v = VaultIdentity with
+  asset = v.asset; shareInstrument = v.shareInstrument; vaultAccount = v.vaultAccount; mode = v.mode
+  decimalsOffset = v.decimalsOffset; assetRegistry = v.assetRegistry; shareRegistry = v.shareRegistry
+
+data ReconcileInput = ReconcileInput with
+    operator : Party
+      -- ^ The vault's operator, whose view the script reads.
+    vaultId : Text
+    journal : Decimal
+      -- ^ Underlying that vault choices moved into the vault account, minus
+      -- what they moved out, from the operator's transaction stream.
+    donations : Decimal
+      -- ^ Underlying that entered the vault account outside vault choices.
+    baseline : Optional VaultIdentity
+      -- ^ The identity recorded when the vault was created, if known.
+  deriving (Eq, Show)
+
+data Report = Report with
+    vaultId : Text
+    recordedAssets : Decimal
+    journal : Decimal
+    recordedShares : Decimal
+    shareSupply : Decimal
+    custody : Decimal
+    donations : Decimal
+    identity : Optional VaultIdentity
+      -- ^ The current state's identity, to record as the next baseline.
+    findings : [Text]
+      -- ^ Empty when the vault reconciles.
+  deriving (Eq, Show)
+
+-- | Reconcile one vault.
+reconcile : ReconcileInput -> Script Report
+reconcile input = do
+  states <- query @VaultState input.operator
+  case [ v | (_, v) <- states, v.vaultId == input.vaultId ] of
+    [v] -> do
+      holdings <- queryInterface @Holding input.operator
+      let views = [ h | (_, Some h) <- holdings ]
+          supply = sum [ h.amount | h <- views, h.instrumentId == v.shareInstrument ]
+          custody = sum [ h.amount | h <- views, h.instrumentId == v.asset, h.account == v.vaultAccount ]
+          findings = concat
+            [ [ "I-01: totalAssets " <> show v.totalAssets <> " differs from the journal " <> show input.journal
+              | v.totalAssets /= input.journal ]
+            , [ "I-02: totalShares " <> show v.totalShares <> " differs from the share supply " <> show supply
+              | v.totalShares /= supply ]
+            , [ "custody: the vault account holds " <> show custody <> ", the journal and donations "
+                  <> show (input.journal + input.donations)
+              | custody /= input.journal + input.donations ]
+            , [ "identity: the vault state's identity " <> show (identityOf v) <> " differs from the baseline " <> show b
+              | Some b <- [input.baseline], b /= identityOf v ]
+            ]
+      pure Report with
+        vaultId = input.vaultId; recordedAssets = v.totalAssets; journal = input.journal
+        recordedShares = v.totalShares; shareSupply = supply; custody; donations = input.donations
+        identity = Some (identityOf v); findings
+    other -> pure Report with
+      vaultId = input.vaultId; recordedAssets = 0.0; journal = input.journal
+      recordedShares = 0.0; shareSupply = 0.0; custody = 0.0; donations = input.donations; identity = None
+      findings = [ "vault state: expected one active state of " <> input.vaultId <> ", found "
+                   <> show (length other) ]

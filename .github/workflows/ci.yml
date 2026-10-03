@@ -1,0 +1,85 @@
+name: ci
+
+# The fast gates of docs/TESTING.md: style (Q-12), token DAR identity (Q-16)
+# and the repository conventions (Q-02) once; then, on every SDK of the
+# matrix, the build (Q-01) and the in-memory unit, coverage, example and tool
+# tests (Q-03). The sandbox (Q-05), sequence (Q-08), mutation (Q-07), proof
+# (Q-09), upgrade (Q-14) and rename (Q-15) gates run locally through
+# scripts/ci.sh (CONTRIBUTING.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DPM_SDK_VERSION: "3.4.11"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Daml
+        uses: ./.github/actions/setup-daml
+        with:
+          sdks: "3.4.11"
+
+      - name: Q-12 style
+        run: scripts/check-style.sh
+
+      - name: Q-16 token DAR identity
+        run: scripts/check-token-dars.sh
+
+      - name: Q-02 conventions
+        run: scripts/check.sh
+
+  sdk:
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ["3.4.11", "3.5.8", "3.5.10"]
+    env:
+      DPM_SDK_VERSION: ${{ matrix.sdk }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # API packages are built by SDK 3.4.11 on every run (D-11).
+      - name: Set up Daml
+        uses: ./.github/actions/setup-daml
+        with:
+          sdks: ${{ matrix.sdk == '3.4.11' && '3.4.11' || format('3.4.11 {0}', matrix.sdk) }}
+
+      - name: Q-01 build
+        run: scripts/build-all.sh
+
+      - name: Q-03 unit tests and coverage
+        run: scripts/check-coverage.sh
+
+      - name: Example tests
+        run: scripts/check-examples.sh
+
+      - name: Tool tests
+        run: scripts/check-tools.sh
+
+      - name: Q-01 API package IDs after the test runs
+        run: scripts/check-api-ids.sh
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.sdk }}
+          path: test-reports/
+          if-no-files-found: ignore

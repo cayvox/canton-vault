@@ -1,0 +1,104 @@
+-- | Interoperability: the D-04 settlement and the request delegation of `docs/SPEC.md` §4.2, with the vault of
+-- `cvx-vault-v1`, its share registry as the share side and Splice 0.8.4
+-- TestTokenV2 as the underlying. Deposits mint shares from `cip-112/mint`;
+-- redemptions burn them to `cip-112/burn`; each execution is one
+-- transaction with one root exercise.
+module Cayvox.VaultV1Test.Interop where
+
+import DA.Assert ((===))
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.VaultSetup
+
+-- | The choices of a transaction tree, depth first.
+choicesOf : TransactionTree -> [Text]
+choicesOf tree = [ e.choice | ExercisedEvent e <- S.flatten tree.rootEvents ]
+
+rootChoices : TransactionTree -> [Text]
+rootChoices tree = [ e.choice | ExercisedEvent e <- tree.rootEvents ]
+
+count : Text -> [Text] -> Int
+count x = length . filter (== x)
+
+-- | A deposit allocated at execution, in one
+-- transaction whose only root is the vault's execution, with one batch
+-- settlement at each registry.
+test_interop_depositMintsShares : Script ()
+test_interop_depositMintsShares = do
+  w <- setupWorld "i-dep" Permissioned 0 1
+  let [alice] = w.requesters
+  tree <- runTree =<< depositAll w w.operator [(alice, 100.0, False)]
+  rootChoices tree === ["Vault_ExecuteDeposits"]
+  count "SettlementFactory_SettleBatch" (choicesOf tree) === 2
+  count "Allocation_Settle" (choicesOf tree) === 4
+  positionOf w alice >>= (=== ((900.0, 0.0), (100.0, 0.0)))
+  totalsOf w >>= (=== (100.0, 100.0))
+
+-- | A deposit funded at request time with a committed allocation.
+test_interop_fundedDeposit : Script ()
+test_interop_fundedDeposit = do
+  w <- setupWorld "i-fdep" Permissioned 0 1
+  let [alice] = w.requesters
+  r <- newDeposit w alice 100.0 0.0 True
+  positionOf w alice >>= (=== ((900.0, 100.0), (0.0, 0.0)))
+  i <- depositItem w alice r
+  _ <- run =<< executeDeposits w w.operator [(alice, i)]
+  positionOf w alice >>= (=== ((900.0, 0.0), (100.0, 0.0)))
+
+-- | Redemptions, unfunded and funded, burn shares to
+-- `cip-112/burn` and pay underlying from the vault's account.
+test_interop_redemptionBurnsShares : Script ()
+test_interop_redemptionBurnsShares = do
+  w <- setupWorld "i-red" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 100.0, False)]
+  tree <- runTree =<< redeemAll w w.operator [(alice, 40.0, False)]
+  rootChoices tree === ["Vault_ExecuteRedeems"]
+  count "SettlementFactory_SettleBatch" (choicesOf tree) === 2
+  positionOf w alice >>= (=== ((940.0, 0.0), (60.0, 0.0)))
+  _ <- run =<< redeemAll w w.operator [(alice, 10.0, True)]
+  positionOf w alice >>= (=== ((950.0, 0.0), (50.0, 0.0)))
+  totalsOf w >>= (=== (50.0, 50.0))
+
+-- | Three requesters, funded and at execution, in one transaction,
+-- in both modes (in Permissionless mode each requester executes its own).
+test_interop_batchOfThree : Script ()
+test_interop_batchOfThree = do
+  w <- setupWorld "i-batch" Permissioned 0 3
+  let [a, b, c] = w.requesters
+  res <- run =<< depositAll w w.operator [(a, 100.0, True), (b, 50.0, False), (c, 25.0, False)]
+  res.outputs === [100.0, 50.0, 25.0]
+  forA_ (zip [a, b, c] [100.0, 50.0, 25.0]) $ \(p, s) -> S.balanceOf w.shares p >>= (=== (s, 0.0))
+  totalsOf w >>= (=== (175.0, 175.0))
+  p <- setupWorld "i-batch-perl" Permissionless 0 1
+  let [alice] = p.requesters
+  -- One requester's unfunded requests would share its input holdings, so
+  -- at most one of them is unfunded.
+  res <- run =<< depositAll p alice [(alice, 10.0, True), (alice, 20.0, True), (alice, 30.0, False)]
+  res.outputs === [10.0, 20.0, 30.0]
+
+-- | A batch whose second request fails at its registry
+-- rolls back as a whole; the first request, its allocations and every
+-- holding are unchanged.
+test_interop_atomicity : Script ()
+test_interop_atomicity = do
+  w <- setupWorld "i-atomic" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  ra <- newDeposit w alice 100.0 0.0 False
+  rb <- newDeposit w bob 2000.0 0.0 False
+  ia <- depositItem w alice ra
+  ib <- depositItem w bob rb
+  before <- forA [alice, bob] (positionOf w)
+  res <- tryS (executeDeposits w w.operator [(alice, ia), (bob, ib)])
+  assertFails (Status generalError InvalidGivenCurrentSystemStateOther) res
+  after <- forA [alice, bob] (positionOf w)
+  before === after
+  totalsOf w >>= (=== (0.0, 0.0))
+  assertActive alice (fst ra)
+  _ <- run =<< executeDeposits w w.operator [(alice, ia)]
+  totalsOf w >>= (=== (100.0, 100.0))

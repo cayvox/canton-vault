@@ -1,0 +1,282 @@
+-- | Implementation of `Cayvox.VaultMathV1`. This module is not public API:
+-- its names and types can change in any release.
+--
+-- A non-negative integer is a list of limbs in base 10^9, least significant
+-- first, with no zero limb at the top; zero is the empty list. Every limb
+-- product plus a carry plus a limb is below 10^18 + 2 * 10^9, inside the
+-- 64-bit `Int` range, so no intermediate overflows. `ARCHITECTURE.md` in this
+-- package gives the derivation and the proof obligations.
+module Cayvox.VaultMathV1.Internal
+  ( -- * Failures
+    failure
+  , errNegativeOperand
+  , errNonPositiveDivisor
+  , errOverflow
+    -- * The checked computation
+  , mulDivChecked
+  , dmax
+    -- * Limbs
+  , Limbs
+  , base
+  , toLimbs
+  , fromLimbs
+  , limbValue
+  , natToNumeric0
+  , normalize
+  , compareLimbs
+  , addLimbs
+  , mulSmall
+  , mulLimbs
+  , divSmall
+  , divModLimbs
+  , dmaxLimbs
+  ) where
+
+import DA.Fail (FailureCategory (..), FailureStatus (..))
+import DA.List (dropWhileEnd, last, (!!))
+import DA.Numeric (cast, shift)
+import qualified DA.TextMap as TextMap
+
+-- Failures
+-----------
+
+-- | A failure of this package: identifier `cayvox.com/<name>`, category
+-- `InvalidGivenCurrentSystemStateOther`, empty `meta` (D-13).
+failure : Text -> Text -> FailureStatus
+failure name message = FailureStatus with
+  errorId = "cayvox.com/" <> name
+  category = InvalidGivenCurrentSystemStateOther
+  message
+  meta = TextMap.empty
+
+-- | `cayvox.com/math-negative-operand`.
+errNegativeOperand : FailureStatus
+errNegativeOperand = failure "math-negative-operand" "an operand is negative"
+
+-- | `cayvox.com/math-non-positive-divisor`.
+errNonPositiveDivisor : FailureStatus
+errNonPositiveDivisor = failure "math-non-positive-divisor" "the divisor is not positive"
+
+-- | `cayvox.com/math-overflow`.
+errOverflow : FailureStatus
+errOverflow = failure "math-overflow" "the result exceeds the largest Decimal"
+
+-- The checked computation
+--------------------------
+
+-- | The largest `Decimal`: 28 integer and 10 fractional digits, all nines.
+dmax : Decimal
+dmax = 9999999999999999999999999999.9999999999
+
+-- | `floor` (or `ceil` when `roundUp`) of the exact `a * b / c`, or the
+-- failure of `docs/MATH.md` section 4, checked in the order of its table.
+mulDivChecked : Bool -> Decimal -> Decimal -> Decimal -> Either FailureStatus Decimal
+mulDivChecked roundUp a b c
+  | a < 0.0 || b < 0.0 = Left errNegativeOperand
+  | c <= 0.0 = Left errNonPositiveDivisor
+  | otherwise =
+      let (q, r) = divModLimbs (mulLimbs (toLimbs a) (toLimbs b)) (toLimbs c)
+          rounded = if roundUp && not (null r) then addLimbs q [1] else q
+      in if compareLimbs rounded dmaxLimbs == GT
+           then Left errOverflow
+           else case fromLimbs rounded of
+             Some x -> Right x
+             None -> Left errOverflow
+
+-- Conversion
+-------------
+
+-- | Limbs of an integer.
+type Limbs = [Int]
+
+-- | The limb base, 10^9.
+base : Int
+base = 1000000000
+
+-- | The limbs of `int(x) = x / 0.0000000001`, for `0 <= x <= dmax`, by
+-- arithmetic the Daml-LF specification states exactly: `shift` to scale
+-- `9 i` exposes limb `i` and everything above it as the integral part, which
+-- `truncate` takes; the limbs above are removed first with an exact
+-- subtraction of their value (`limbValue`). No step rounds and no text is
+-- read.
+toLimbs : Decimal -> Limbs
+toLimbs x =
+  let l4 = truncate (shift @36 x)
+      r4 = x - limbValue 4 l4
+      l3 = truncate (shift @27 r4)
+      r3 = r4 - limbValue 3 l3
+      l2 = truncate (shift @18 r3)
+      r2 = r3 - limbValue 2 l2
+      l1 = truncate (shift @9 r2)
+      r1 = r2 - limbValue 1 l1
+      l0 = truncate (shift @0 r1)
+  in normalize [l0, l1, l2, l3, l4]
+
+-- | The `Decimal` whose `int` is `limb * B^i`, for `0 <= limb < B` at limb
+-- position `i` from 0 to 4: the limb, built exactly as a `Numeric 0`, is
+-- cast without loss to scale `9 i` and shifted to scale 10, which multiplies
+-- it by `10^(9 i - 10)`.
+limbValue : Int -> Int -> Decimal
+limbValue 0 l = shift @10 (natToNumeric0 l)
+limbValue 1 l = shift @10 (cast @9 (natToNumeric0 l))
+limbValue 2 l = shift @10 (cast @18 (natToNumeric0 l))
+limbValue 3 l = shift @10 (cast @27 (natToNumeric0 l))
+limbValue 4 l = shift @10 (cast @36 (natToNumeric0 l))
+limbValue _ _ = error "limbValue: limb position above 4"
+
+-- | `n >= 0` as a `Numeric 0`, by binary Horner steps from the literal `1.0`
+-- with exact addition only.
+natToNumeric0 : Int -> Numeric 0
+natToNumeric0 n
+  | n <= 0 = 0.0
+  | otherwise =
+      let half = natToNumeric0 (n / 2)
+          twice = half + half
+      in if n % 2 == 1 then twice + 1.0 else twice
+
+-- | The `Decimal` whose `int` is the given limbs, or `None` above `dmax`.
+-- The limb values are added exactly; no step rounds.
+fromLimbs : Limbs -> Optional Decimal
+fromLimbs limbs
+  | compareLimbs limbs dmaxLimbs == GT = None
+  | otherwise = Some (foldl (+) 0.0 (zipWith limbValue [0 .. 4] (padTo 5 (normalize limbs))))
+
+-- Limb arithmetic
+------------------
+
+-- | Drops zero limbs at the top.
+normalize : Limbs -> Limbs
+normalize = dropWhileEnd (== 0)
+
+-- | Compares the integers two limb lists denote.
+compareLimbs : Limbs -> Limbs -> Ordering
+compareLimbs a b =
+  let a' = normalize a
+      b' = normalize b
+  in case compare (length a') (length b') of
+       EQ -> compare (reverse a') (reverse b')
+       o -> o
+
+-- | a + b.
+addLimbs : Limbs -> Limbs -> Limbs
+addLimbs a b = normalize (addCarry a b 0)
+
+addCarry : Limbs -> Limbs -> Int -> Limbs
+addCarry [] [] c = if c == 0 then [] else [c]
+addCarry (x :: xs) [] c = let s = x + c in (s % base) :: addCarry xs [] (s / base)
+addCarry [] (y :: ys) c = let s = y + c in (s % base) :: addCarry [] ys (s / base)
+addCarry (x :: xs) (y :: ys) c = let s = x + y + c in (s % base) :: addCarry xs ys (s / base)
+
+-- | a * m, for a single limb 0 <= m < base.
+mulSmall : Limbs -> Int -> Limbs
+mulSmall a m = normalize (mulCarry m a 0)
+
+mulCarry : Int -> Limbs -> Int -> Limbs
+mulCarry _ [] c = if c == 0 then [] else [c]
+mulCarry m (x :: xs) c = let p = x * m + c in (p % base) :: mulCarry m xs (p / base)
+
+-- | a * b, schoolbook.
+mulLimbs : Limbs -> Limbs -> Limbs
+mulLimbs a b =
+  foldl addLimbs [] [ replicate i 0 ++ mulSmall b ai | (i, ai) <- zip [0 .. length a - 1] a, ai /= 0 ]
+
+-- | Quotient and remainder of a by a single limb 0 < v < base.
+divSmall : Limbs -> Int -> (Limbs, Int)
+divSmall a v =
+  let (qs, r) = foldr (divStep v) ([], 0) a
+  in (normalize qs, r)
+
+divStep : Int -> Int -> (Limbs, Int) -> (Limbs, Int)
+divStep v x (acc, r) = let cur = r * base + x in ((cur / v) :: acc, cur % v)
+
+-- | Quotient and remainder of u by a non-zero v: short division for a single
+-- limb, else Knuth's Algorithm D (TAOCP vol. 2, 4.3.1).
+divModLimbs : Limbs -> Limbs -> (Limbs, Limbs)
+divModLimbs u0 v0 =
+  let u = normalize u0
+      v = normalize v0
+  in case v of
+    [] -> error "divModLimbs: division by zero"
+    [single] -> let (q, r) = divSmall u single in (q, normalize [r])
+    _ | compareLimbs u v == LT -> ([], u)
+      | otherwise -> algorithmD u v
+
+algorithmD : Limbs -> Limbs -> (Limbs, Limbs)
+algorithmD u v =
+  let n = length v
+      m = length u - n
+      d = base / (last v + 1)                        -- D1: normalize
+      un = padTo (m + n + 1) (mulSmall u d)
+      vn = padTo n (mulSmall v d)
+      vTop = vn !! (n - 1)
+      vNext = vn !! (n - 2)
+      (qs, uFinal) = foldl (stepD n vn vTop vNext) ([], un) (reverse [0 .. m])
+      remainder = fst (divSmall (take n uFinal) d)   -- D8: unnormalize
+  in (normalize qs, remainder)
+
+padTo : Int -> Limbs -> Limbs
+padTo k xs = xs ++ replicate (k - length xs) 0
+
+-- | Iteration j of Algorithm D (D3 to D7). Quotient limbs are prepended from
+-- the most significant, so the list ends least significant first.
+stepD : Int -> Limbs -> Int -> Int -> (Limbs, Limbs) -> Int -> (Limbs, Limbs)
+stepD n vn vTop vNext (qs, un) j =
+  let num = (un !! (j + n)) * base + (un !! (j + n - 1))    -- D3
+      qhat = refineQ vTop vNext (un !! (j + n - 2)) (num / vTop) (num % vTop)
+      (window, negative) = mulSub (slice j (n + 1) un) vn qhat   -- D4
+      (window', q) =
+        if negative then (addBack window vn, qhat - 1) else (window, qhat)   -- D5, D6
+  in (q :: qs, replaceSlice j window' un)
+
+-- | D3: lowers the estimate q, with remainder r < base, while it is too
+-- large, testing it against the next limb of the divisor; stops once the
+-- remainder reaches base, where the test can no longer hold.
+refineQ : Int -> Int -> Int -> Int -> Int -> Int
+refineQ vTop vNext uNext q r
+  | q >= base || q * vNext > r * base + uNext =
+      let q' = q - 1
+          r' = r + vTop
+      in if r' >= base then q' else refineQ vTop vNext uNext q' r'
+  | otherwise = q
+
+slice : Int -> Int -> Limbs -> Limbs
+slice start len xs = take len (drop start xs)
+
+replaceSlice : Int -> Limbs -> Limbs -> Limbs
+replaceSlice start ys xs = take start xs ++ ys ++ drop (start + length ys) xs
+
+-- | D4: window - q * v over n + 1 limbs, modulo base^(n+1), and whether the
+-- true difference is negative.
+mulSub : Limbs -> Limbs -> Int -> (Limbs, Bool)
+mulSub window v q =
+  let (res, carry, borrow) = mulSubGo q window v 0 0
+  in (res, carry + borrow > 0)
+
+mulSubGo : Int -> Limbs -> Limbs -> Int -> Int -> (Limbs, Int, Int)
+mulSubGo _ [] _ carry borrow = ([], carry, borrow)
+mulSubGo q (w :: ws) vs carry borrow =
+  let (vi, vs') = case vs of
+        x :: rest -> (x, rest)
+        [] -> (0, [])
+      p = q * vi + carry
+      diff = w - (p % base) - borrow
+      (digit, borrow') = if diff < 0 then (diff + base, 1) else (diff, 0)
+      (rest, c, b) = mulSubGo q ws vs' (p / base) borrow'
+  in (digit :: rest, c, b)
+
+-- | D6: window + v over n + 1 limbs, dropping the carry out of the top limb.
+addBack : Limbs -> Limbs -> Limbs
+addBack window v = addBackGo window v 0
+
+addBackGo : Limbs -> Limbs -> Int -> Limbs
+addBackGo [] _ _ = []
+addBackGo (w :: ws) vs c =
+  let (vi, vs') = case vs of
+        x :: rest -> (x, rest)
+        [] -> (0, [])
+      s = w + vi + c
+  in (s % base) :: addBackGo ws vs' (s / base)
+
+-- | The limbs of `int(dmax)`, 10^38 - 1.
+dmaxLimbs : Limbs
+dmaxLimbs = [999999999, 999999999, 999999999, 999999999, 99]

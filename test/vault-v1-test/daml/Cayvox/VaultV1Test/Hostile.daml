@@ -1,0 +1,162 @@
+-- | Hostile fixtures (`docs/SECURITY.md`, T-06, T-12, T-13): contracts a
+-- party other than the operator controls, built to trick the registry.
+module Cayvox.VaultV1Test.Hostile where
+
+import qualified DA.Map as Map
+import qualified DA.TextMap as TextMap
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferEventsV2 as Events
+
+import Cayvox.VaultV1 (DepositRequest (..), DepositRequest_Allocate (..), VaultState (..))
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard (receiverSide)
+import Cayvox.VaultV1.Internal.Vault (Kind (..), allocateAt, allocationSpec, inLeg, outLeg, requestSettlement, settleAt)
+
+-- | T-06: an allocation signed by Mallory whose view claims the operator's
+-- registry and settlement. If the registry settled it through the interface,
+-- its settle choice would run with the operator's authority.
+template ForgedAllocation
+  with
+    mallory : Party
+    operator : Party
+    instrument : InstrumentId
+    forgedView : AllocationView
+  where
+    signatory mallory
+    observer operator
+
+    interface instance Allocation for ForgedAllocation where
+      view = forgedView
+      allocation_settleExtraObservers _ = []
+      allocation_cancelExtraObservers _ = []
+      allocation_withdrawExtraObservers _ = []
+      allocation_settleImpl _ _ = do
+        -- With the operator's authority, this would mint shares to Mallory.
+        _ <- create ShareHolding with
+          admin = operator
+          instrumentId = instrument
+          account = Account with owner = Some mallory; provider = None; id = ""
+          amount = 1000000.0; lock = None; lockObservers = []; meta = emptyMetadata
+        pure AllocationResult with
+          output = AllocationResult_Settled with nextIterationAllocationCid = None
+          authorizerHoldingCids = TextMap.empty
+          meta = emptyMetadata
+      allocation_cancelImpl _ _ = abort "not used"
+      allocation_withdrawImpl _ _ = abort "not used"
+
+-- | T-06: a holding signed by its owner that claims to be a share holding.
+template ForeignHolding
+  with
+    owner : Party
+    claimed : HoldingView
+  where
+    signatory owner
+
+    interface instance Holding for ForeignHolding where
+      view = claimed
+
+-- | T-12: Mallory's attempt to report events for the operator's registry.
+template EventSpoofer
+  with
+    mallory : Party
+    operator : Party
+    victim : Account
+  where
+    signatory mallory
+
+    -- | Creates an event log for the victim's account and reports a change.
+    nonconsuming choice EventSpoofer_Spoof : ()
+      controller mallory
+      do
+        logCid <- create ShareEventLog with admin = operator; account = victim
+        _ <- exercise (toInterfaceContractId @Events.EventLog logCid) Events.EventLog_HoldingsChange with
+          admin = operator; account = victim; inputHoldingCids = []; transferLegSides = []
+          outputHoldingCids = []; observers = [mallory]; extraArgs = ExtraArgs emptyChoiceContext emptyMetadata
+        pure ()
+
+-- | T-13: Mallory's attempt to create shares for herself.
+template ShareMinter
+  with
+    mallory : Party
+    operator : Party
+    instrumentId : InstrumentId
+  where
+    signatory mallory
+
+    nonconsuming choice ShareMinter_Mint : ContractId ShareHolding
+      controller mallory
+      do
+        create ShareHolding with
+          admin = operator
+          instrumentId
+          account = Account with owner = Some mallory; provider = None; id = ""
+          amount = 1000000.0; lock = None; lockObservers = []; meta = emptyMetadata
+
+-- | An empty available-actions map, for forged views.
+noActions : Map.Map AllocationAction [[Party]]
+noActions = Map.empty
+
+-- | T-20: an allocation factory signed by Mallory whose view
+-- claims the underlying admin. Recorded in a vault state by the operator's
+-- mistake, its allocate choice would run with the vault's actors'
+-- authority: it mints shares to Mallory, then forwards to the real factory
+-- so that the execution completes.
+template ForgedFactory
+  with
+    mallory : Party
+    operator : Party
+    instrument : InstrumentId
+    claimedAdmin : Party
+    real : ContractId AllocationFactory
+  where
+    signatory mallory
+    observer operator
+
+    interface instance AllocationFactory for ForgedFactory where
+      view = AllocationFactoryView with admin = claimedAdmin; meta = emptyMetadata
+      allocationFactory_allocateExtraObservers _ = []
+      allocationFactory_allocateImpl _ arg = do
+        _ <- create ShareHolding with
+          admin = operator
+          instrumentId = instrument
+          account = Account with owner = Some mallory; provider = None; id = ""
+          amount = 1000000.0; lock = None; lockObservers = []; meta = emptyMetadata
+        exercise real arg
+      allocationFactory_publicFetchImpl _ _ = pure AllocationFactoryView with admin = claimedAdmin; meta = emptyMetadata
+
+-- | T-21 with execution-time funding: the operator exercises an unfunded
+-- request's delegation outside any execution, which creates the requester's
+-- funding allocation, and settles the input leg alone in the same
+-- transaction, so the requester cannot withdraw in between.
+template LoneSettler
+  with
+    operator : Party
+  where
+    signatory operator
+
+    nonconsuming choice LoneSettler_Take : ()
+      with
+        vault : ContractId VaultState
+        request : ContractId DepositRequest
+        fundingInputs : [ContractId Holding]
+        receiptAmount : Decimal
+        assetContext : ExtraArgs
+        shareContext : ExtraArgs
+      controller operator
+      do
+        v <- fetch vault
+        r <- fetch request
+        let receiptLeg = outLeg Deposit v.vaultAccount v.asset v.shareInstrument r.receiver receiptAmount
+            settlement = requestSettlement operator r.vaultId Deposit (coerceContractId request)
+            input = inLeg Deposit v.vaultAccount v.asset v.shareInstrument r.payAccount r.amount
+        allocations <- exercise request DepositRequest_Allocate with
+          vault; receiptLeg; fundingInputs; assetContext; shareContext
+        let Some funding = allocations.funding
+        vaultIn <- allocateAt v.assetRegistry.allocationFactory settlement
+          (allocationSpec v.asset.admin v.vaultAccount (receiverSide input) (Some r.deadline) False) [] assetContext operator
+        settleAt v.assetRegistry.settlementFactory settlement input [funding, vaultIn] assetContext operator
+

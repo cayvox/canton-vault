@@ -1,0 +1,499 @@
+-- | Tests of `Cayvox.VaultV1.Conversion` (`docs/MATH.md` §7 and §8):
+-- rounding at exact divisibility and one unit on each side, every failure
+-- with the failure helper, the offsets 0, 10 and 11 with the first deposit
+-- and the capacity bounds, V-01 to V-04, and the T-01 arithmetic.
+module Cayvox.VaultV1Test.Conversion where
+
+import DA.Assert ((===))
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import DA.List ((!!), head)
+import qualified DA.TextMap as TextMap
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2 (InstrumentId (..))
+import Splice.Api.Token.MetadataV1 (Metadata (..))
+
+import Cayvox.Api.VaultV1
+import Cayvox.Testing.Assert
+import Cayvox.VaultMathV1 (Rounding (..), mulDiv)
+import Cayvox.VaultV1.Conversion
+import Cayvox.VaultV1Test.Setup (check)
+
+-- Fixtures
+-----------
+
+-- | The six functions, for the harness and for sweeps.
+data Fn = ConvertToShares | ConvertToAssets | PreviewDeposit | PreviewMint | PreviewWithdraw | PreviewRedeem
+  deriving (Eq, Show, Enum, Bounded)
+
+allFns : [Fn]
+allFns = [minBound .. maxBound]
+
+apply : Fn -> VaultView -> Decimal -> Decimal
+apply ConvertToShares = convertToShares
+apply ConvertToAssets = convertToAssets
+apply PreviewDeposit = previewDeposit
+apply PreviewMint = previewMint
+apply PreviewWithdraw = previewWithdraw
+apply PreviewRedeem = previewRedeem
+
+-- | Runs a conversion in a transaction, so that its failure is asserted
+-- through `trySubmit` and the failure helper (`docs/TESTING.md`, rule 1).
+template ConversionHarness
+  with
+    owner : Party
+  where
+    signatory owner
+
+    nonconsuming choice Convert : Decimal
+      with
+        fn : Fn
+        vaultView : VaultView
+        amount : Decimal
+      controller owner
+      do pure (apply fn vaultView amount)
+
+-- | A party and a harness.
+data Rig = Rig with
+    party : Party
+    harness : ContractId ConversionHarness
+
+rig : Text -> Script Rig
+rig tag = do
+  party <- allocateParty ("conversion-" <> tag)
+  harness <- submit party $ createCmd ConversionHarness with owner = party
+  pure Rig with party; harness
+
+-- | A view with the given offset, assets and shares; the other fields are
+-- fixed and do not enter the conversions.
+viewAt : Party -> Int -> Decimal -> Decimal -> VaultView
+viewAt operator k a s = VaultView with
+  operator
+  vaultId = "vault-conversion"
+  asset = InstrumentId with admin = operator; id = "underlying"
+  shareInstrument = InstrumentId with admin = operator; id = "vault-conversion"
+  totalAssets = a
+  totalShares = s
+  decimalsOffset = k
+  mode = Permissioned
+  paused = False
+  meta = Metadata with values = TextMap.empty
+
+-- | Run a conversion through the harness.
+tryConvert : Rig -> Fn -> VaultView -> Decimal -> Script (Either SubmitError Decimal)
+tryConvert r fn v x = trySubmit r.party (exerciseCmd r.harness Convert with fn; vaultView = v; amount = x)
+
+-- | The vault's failure with the given name.
+vault : Text -> Expected
+vault name = Status ("cayvox.com/vault-" <> name) InvalidGivenCurrentSystemStateOther
+
+-- | The math package's failure with the given name.
+math : Text -> Expected
+math name = Status ("cayvox.com/math-" <> name) InvalidGivenCurrentSystemStateOther
+
+u : Decimal
+u = 0.0000000001
+
+dmax : Decimal
+dmax = 9999999999999999999999999999.9999999999
+
+-- | `10^k * u` for k from 0 to 10, as literals.
+tenToTheKUnits : [Decimal]
+tenToTheKUnits =
+  [ 0.0000000001, 0.000000001, 0.00000001, 0.0000001, 0.000001, 0.00001
+  , 0.0001, 0.001, 0.01, 0.1, 1.0 ]
+
+-- | `AMAX(k) = floor(DMAX / 10^k)` for k = 0, 10 and 11, as literals.
+amax0, amax10, amax11 : Decimal
+amax0 = 9999999999999999999999999999.9999999999
+amax10 = 999999999999999999.9999999999
+amax11 = 99999999999999999.9999999999
+
+-- Rounding direction
+---------------------
+
+-- In the state k = 1, A = 2u, S = 10u: A + VA = 3u and S + VS = 20u, so
+-- assets convert to shares at 20/3 and shares to assets at 3/20. The amounts
+-- 3u and 20u divide exactly; the amounts one unit on each side do not.
+
+roundingState : Party -> VaultView
+roundingState p = viewAt p 1 0.0000000002 0.000000001
+
+-- | `convertToShares` rounds down: 2u, 3u, 4u give 13u, 20u, 26u.
+test_convertToShares_roundsDown : Script ()
+test_convertToShares_roundsDown = do
+  p <- allocateParty "round-cts"
+  let v = roundingState p
+  map (convertToShares v) [0.0000000002, 0.0000000003, 0.0000000004] === [0.0000000013, 0.000000002, 0.0000000026]
+
+-- | `previewDeposit` rounds down: 2u, 3u, 4u give 13u, 20u, 26u.
+test_previewDeposit_roundsDown : Script ()
+test_previewDeposit_roundsDown = do
+  p <- allocateParty "round-pd"
+  let v = roundingState p
+  map (previewDeposit v) [0.0000000002, 0.0000000003, 0.0000000004] === [0.0000000013, 0.000000002, 0.0000000026]
+
+-- | `previewWithdraw` rounds up: 2u, 3u, 4u give 14u, 20u, 27u.
+test_previewWithdraw_roundsUp : Script ()
+test_previewWithdraw_roundsUp = do
+  p <- allocateParty "round-pw"
+  let v = roundingState p
+  map (previewWithdraw v) [0.0000000002, 0.0000000003, 0.0000000004] === [0.0000000014, 0.000000002, 0.0000000027]
+
+-- | `convertToAssets` rounds down: 19u, 20u, 21u give 2u, 3u, 3u.
+test_convertToAssets_roundsDown : Script ()
+test_convertToAssets_roundsDown = do
+  p <- allocateParty "round-cta"
+  let v = roundingState p
+  map (convertToAssets v) [0.0000000019, 0.000000002, 0.0000000021] === [0.0000000002, 0.0000000003, 0.0000000003]
+
+-- | `previewRedeem` rounds down: 19u, 20u, 21u give 2u, 3u, 3u.
+test_previewRedeem_roundsDown : Script ()
+test_previewRedeem_roundsDown = do
+  p <- allocateParty "round-pr"
+  let v = roundingState p
+  map (previewRedeem v) [0.0000000019, 0.000000002, 0.0000000021] === [0.0000000002, 0.0000000003, 0.0000000003]
+
+-- | `previewMint` rounds up: 19u, 20u, 21u give 3u, 3u, 4u.
+test_previewMint_roundsUp : Script ()
+test_previewMint_roundsUp = do
+  p <- allocateParty "round-pm"
+  let v = roundingState p
+  map (previewMint v) [0.0000000019, 0.000000002, 0.0000000021] === [0.0000000003, 0.0000000003, 0.0000000004]
+
+-- | The same directions at large magnitudes, k = 10: A + VA = 3 * 10^9 u
+-- and S + VS = 2 * 10^19 u.
+test_conversion_roundsAtLargeMagnitudes : Script ()
+test_conversion_roundsAtLargeMagnitudes = do
+  p <- allocateParty "round-large"
+  let v = viewAt p 10 0.2999999999 1999999999.0
+  map (previewDeposit v) [0.2, 0.3] === [1333333333.3333333333, 2000000000.0]
+  map (previewWithdraw v) [0.2, 0.3] === [1333333333.3333333334, 2000000000.0]
+  map (previewRedeem v) [1999999999.9999999999, 2000000000.0] === [0.2999999999, 0.3]
+  map (previewMint v) [1999999999.9999999999, 2000000000.0] === [0.3, 0.3]
+
+-- Failures of the view (step 1)
+--------------------------------
+
+-- | Every function fails `vault-capacity-exceeded` for an offset outside
+-- `0 <= k <= 10`; the helper rejects another identifier.
+test_conversion_rejectsOffsetOutOfRange : Script ()
+test_conversion_rejectsOffsetOutOfRange = do
+  r <- rig "offset"
+  forA_ allFns $ \fn -> do
+    tryConvert r fn (viewAt r.party (-1) 0.0 0.0) 1.0 >>= assertFails (vault "capacity-exceeded")
+    res <- tryConvert r fn (viewAt r.party 11 0.0 0.0) 1.0
+    assertFails (vault "capacity-exceeded") res
+    case res of
+      Left err -> check "the helper accepts another identifier" (not (matches (math "overflow") err))
+      Right _ -> abort "expected a failure"
+    tryConvert r fn (viewAt r.party 10 0.0 0.0) 1.0 >>= either (abort . show) (const (pure ()))
+
+-- | Every function fails for negative assets or shares.
+test_conversion_rejectsNegativeTotals : Script ()
+test_conversion_rejectsNegativeTotals = do
+  r <- rig "negative"
+  forA_ allFns $ \fn -> do
+    tryConvert r fn (viewAt r.party 0 (-u) 0.0) 1.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party 0 (-1.0) 0.0) 1.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party 10 (-1.0) 0.0) 1.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party 0 1.0 (-u)) 1.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party 0 0.0 0.0) 1.0 >>= either (abort . show) (const (pure ()))
+
+-- | Every function fails when `A + VA` exceeds `AMAX(k)`, at k = 0 and 10;
+-- `A + VA = AMAX(k)` is accepted.
+test_conversion_rejectsAssetsAboveBound : Script ()
+test_conversion_rejectsAssetsAboveBound = do
+  r <- rig "asset-bound"
+  forA_ allFns $ \fn -> forA_ [(0, amax0), (10, amax10)] $ \(k, cap) -> do
+    tryConvert r fn (viewAt r.party k (cap - u + u) 0.0) 0.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party k (cap - u) 0.0) 0.0 >>= either (abort . show) (const (pure ()))
+
+-- | Every function fails when `S + VS` exceeds `10^k (A + VA)`, at k = 0 and
+-- 10; equality is accepted.
+test_conversion_rejectsSharesAboveInvariant : Script ()
+test_conversion_rejectsSharesAboveInvariant = do
+  r <- rig "invariant"
+  forA_ allFns $ \fn -> do
+    -- k = 0: S <= A
+    tryConvert r fn (viewAt r.party 0 5.0 5.0000000001) 1.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party 0 5.0 5.0) 1.0 >>= either (abort . show) (const (pure ()))
+    -- k = 10: S <= 10^10 A
+    tryConvert r fn (viewAt r.party 10 5.0 50000000000.0000000001) 1.0 >>= assertFails (vault "capacity-exceeded")
+    tryConvert r fn (viewAt r.party 10 5.0 50000000000.0) 1.0 >>= either (abort . show) (const (pure ()))
+
+-- Failures of the amount (steps 2 and 3)
+-----------------------------------------
+
+-- | A deposit that would take `A + VA` past `AMAX(k)` fails; the largest one
+-- that fits is accepted (k = 0 and 10, empty and non-empty vault).
+test_conversion_depositRoom : Script ()
+test_conversion_depositRoom = do
+  r <- rig "deposit-room"
+  forA_ [ConvertToShares, PreviewDeposit] $ \fn ->
+    forA_ [(0, amax0, 0.0, 0.0), (0, amax0, 7.0, 3.0), (10, amax10, 0.0, 0.0), (10, amax10, 7.0, 3.0)] $ \(k, cap, a, s) -> do
+      let room = cap - u - a
+      tryConvert r fn (viewAt r.party k a s) (room + u) >>= assertFails (vault "capacity-exceeded")
+      tryConvert r fn (viewAt r.party k a s) room >>= either (abort . show) (const (pure ()))
+
+-- | A mint whose assets would take `A + VA` past `AMAX(k)` fails; the largest
+-- that fits is accepted and charges at most the room.
+test_conversion_mintRoom : Script ()
+test_conversion_mintRoom = do
+  r <- rig "mint-room"
+  -- k = 0, A = 0, S = 0: one share costs one asset; the room is DMAX - u.
+  let empty0 = viewAt r.party 0 0.0 0.0
+  tryConvert r PreviewMint empty0 dmax >>= assertFails (vault "capacity-exceeded")
+  tryConvert r PreviewMint empty0 (dmax - u) >>= either (abort . show) (=== (dmax - u))
+  -- k = 0, A = 3u, S = 1u: A + VA = 4u, S + VS = 2u, one share unit costs two;
+  -- the room is DMAX - 4u, so at most half of it, rounded down, in shares.
+  let v = viewAt r.party 0 0.0000000003 0.0000000001
+      most = 4999999999999999999999999999.9999999997
+  tryConvert r PreviewMint v (most + u) >>= assertFails (vault "capacity-exceeded")
+  tryConvert r PreviewMint v most >>= either (abort . show) (=== (dmax - u - u - u - u - u))
+
+-- | Every function fails `math-negative-operand` for a negative amount.
+test_conversion_rejectsNegativeAmount : Script ()
+test_conversion_rejectsNegativeAmount = do
+  r <- rig "negative-amount"
+  forA_ allFns $ \fn ->
+    tryConvert r fn (viewAt r.party 0 5.0 5.0) (-u) >>= assertFails (math "negative-operand")
+
+-- | The conversions of operations that lower `A` and `S` fail with
+-- `math-overflow` for an amount far beyond the vault's supply or assets.
+test_conversion_overflowsBeyondTheVault : Script ()
+test_conversion_overflowsBeyondTheVault = do
+  r <- rig "overflow"
+  -- k = 0, A = 2u, S = 0: one share unit is worth three asset units.
+  let v = viewAt r.party 0 0.0000000002 0.0
+  tryConvert r ConvertToAssets v dmax >>= assertFails (math "overflow")
+  tryConvert r PreviewRedeem v dmax >>= assertFails (math "overflow")
+  -- k = 10, A = 0, S = 0: one asset unit is worth 10^10 share units.
+  tryConvert r PreviewWithdraw (viewAt r.party 10 0.0 0.0) 1000000000000000000.0 >>= assertFails (math "overflow")
+  tryConvert r PreviewWithdraw (viewAt r.party 10 0.0 0.0) 999999999999999999.9999999999
+    >>= either (abort . show) (=== 9999999999999999999999999999.0)
+
+-- Offsets 0, 10 and 11 and the first deposit (V-04)
+----------------------------------------------------
+
+-- | V-04: with A = 0 and S = 0, a first deposit of `a` mints `a * 10^k`, for
+-- every k from 0 to 10.
+test_conversion_firstDepositMintsTenToTheK : Script ()
+test_conversion_firstDepositMintsTenToTheK = do
+  p <- allocateParty "first-deposit"
+  forA_ (zip [0 .. 10] tenToTheKUnits) $ \(k, unitShares) -> do
+    let v = viewAt p k 0.0 0.0
+    previewDeposit v u === unitShares
+    convertToShares v u === unitShares
+  previewDeposit (viewAt p 0 0.0 0.0) 1.2345678901 === 1.2345678901
+  previewDeposit (viewAt p 10 0.0 0.0) 1.2345678901 === 12345678901.0
+
+-- | The largest first deposit fits both bounds at k = 0 and k = 10; at
+-- k = 11 every function refuses the view.
+test_conversion_capacityAtOffsets : Script ()
+test_conversion_capacityAtOffsets = do
+  r <- rig "offsets"
+  let empty k = viewAt r.party k 0.0 0.0
+  previewDeposit (empty 0) (amax0 - u) === dmax - u
+  previewDeposit (empty 10) (amax10 - u) === 9999999999999999999999999998.0
+  forA_ allFns $ \fn ->
+    tryConvert r fn (empty 11) (amax11 - u) >>= assertFails (vault "capacity-exceeded")
+
+-- Properties over sampled states (V-01 to V-03)
+------------------------------------------------
+
+-- | A linear congruential generator, for deterministic samples.
+next : Int -> Int
+next x = (1103515245 * x + 12345) % 2147483648
+
+-- | A decimal of at most `digits` significant units (1 to 27), from the
+-- generator.
+sampleAmount : Int -> Int -> Decimal
+sampleAmount seed digits =
+  let s1 = next seed
+      s2 = next s1
+      s3 = next s2
+      full = intToDecimal (s3 % 1000000000) * 100000000.0 + intToDecimal (s2 % 1000000000) * 0.1
+        + intToDecimal (s1 % 1000000000) * u
+  in mulDiv Floor full 1.0 (10.0 ^ (27 - digits))
+
+-- | A state reachable for the offset: A below its bound, S at most 10^k A.
+sampleState : Party -> Int -> Int -> (VaultView, Int)
+sampleState p seed0 k =
+  let s1 = next seed0
+      s2 = next s1
+      a = sampleAmount s1 (1 + s1 % 27)
+      sharesCap = mulDiv Floor a (tenToTheKUnits !! k) u
+      s = mulDiv Floor sharesCap (intToDecimal (s2 % 1001)) 1000.0
+  in (viewAt p k a s, next s2)
+
+-- | Samples of (view, amount) over k in {0, 1, 5, 10}.
+samples : Party -> Int -> [(VaultView, Decimal)]
+samples p n = samplesFrom p n 20260930 []
+
+samplesFrom : Party -> Int -> Int -> [(VaultView, Decimal)] -> [(VaultView, Decimal)]
+samplesFrom p i seed acc
+  | i <= 0 = acc
+  | otherwise =
+      let k = [0, 1, 5, 10] !! (i % 4)
+          (v, seed1) = sampleState p seed k
+          seed2 = next seed1
+          amount = sampleAmount seed2 (1 + seed2 % 27)
+      in samplesFrom p (i - 1) (next seed2) ((v, amount) :: acc)
+
+-- | The largest deposit and the largest mint within the asset bound.
+depositable : VaultView -> Decimal
+depositable v = amaxOf v.decimalsOffset - u - v.totalAssets
+
+mintable : VaultView -> Decimal
+mintable v = convertToShares v (depositable v)
+
+-- | V-01: `previewRedeem (previewDeposit a) <= a`, in the same state and in
+-- the state after the deposit.
+test_conversion_v01_roundTripNeverGains : Script ()
+test_conversion_v01_roundTripNeverGains = do
+  p <- allocateParty "v01"
+  forA_ (samples p 200) $ \(v, a0) -> do
+    let a = min a0 (depositable v)
+        m = previewDeposit v a
+        after = v with totalAssets = v.totalAssets + a; totalShares = v.totalShares + m
+    check ("V-01 same state " <> show (v.decimalsOffset, v.totalAssets, v.totalShares, a)) (previewRedeem v m <= a)
+    check ("V-01 after deposit " <> show (v.decimalsOffset, v.totalAssets, v.totalShares, a)) (previewRedeem after m <= a)
+
+-- | V-02: `previewMint s >= convertToAssets s` and
+-- `previewWithdraw a >= convertToShares a`.
+test_conversion_v02_upDirectionsDominate : Script ()
+test_conversion_v02_upDirectionsDominate = do
+  p <- allocateParty "v02"
+  forA_ (samples p 200) $ \(v, x0) -> do
+    let x = min x0 (mintable v)
+        a = min x0 (depositable v)
+    check "V-02 mint" (previewMint v x >= convertToAssets v x)
+    check "V-02 withdraw" (previewWithdraw v a >= convertToShares v a)
+
+-- | One step of a party's sequence: the new state and the party's shares,
+-- assets in and assets out. Steps the vault would refuse (zero output, or
+-- more than the party holds) are skipped.
+data Holder = Holder with
+    state : VaultView
+    held : Decimal
+    paidIn : Decimal
+    paidOut : Decimal
+
+stepParty : Holder -> (Bool, Decimal) -> Holder
+stepParty st (isDeposit, amount)
+  | isDeposit =
+      let v = st.state
+          room = amaxOf v.decimalsOffset - u - v.totalAssets
+          a = if amount > room then room else amount
+          m = previewDeposit v a
+      in if m == 0.0 then st
+         else st with
+           state = (v with totalAssets = v.totalAssets + a; totalShares = v.totalShares + m)
+           held = st.held + m
+           paidIn = st.paidIn + a
+  | otherwise =
+      let v = st.state
+          s = if amount > st.held then st.held else amount
+          y = previewRedeem v s
+      in if y == 0.0 || s == 0.0 then st
+         else st with
+           state = (v with totalAssets = v.totalAssets - y; totalShares = v.totalShares - s)
+           held = st.held - s
+           paidOut = st.paidOut + y
+
+amaxOf : Int -> Decimal
+amaxOf k = mulDiv Floor dmax u (tenToTheKUnits !! k)
+
+-- | V-03: a party that deposits and redeems, with no yield, never ends with
+-- more underlying than it put in, whatever the other holders' shares.
+test_conversion_v03_noSequenceGains : Script ()
+test_conversion_v03_noSequenceGains = do
+  p <- allocateParty "v03"
+  forA_ (zip [1 .. 60] (samples p 60)) $ \(i, (v0, _)) -> do
+    let ops = take 30 (opsFrom (i * 7919))
+        final = foldl stepParty (Holder with state = v0; held = 0.0; paidIn = 0.0; paidOut = 0.0) ops
+        closed = stepParty final (False, final.held)
+    check ("V-03 " <> show (v0.decimalsOffset, v0.totalAssets, v0.totalShares, closed.paidIn, closed.paidOut))
+      (closed.paidOut <= closed.paidIn)
+
+-- | Operations from a seed: deposits and redemptions of mixed magnitudes.
+opsFrom : Int -> [(Bool, Decimal)]
+opsFrom = opsOf 40
+
+opsOf : Int -> Int -> [(Bool, Decimal)]
+opsOf n s
+  | n <= 0 = []
+  | otherwise =
+      let s1 = next s
+          s2 = next s1
+      in (s1 % 2 == 0, sampleAmount s2 (1 + s2 % 20)) :: opsOf (n - 1) s2
+
+-- T-01 arithmetic
+------------------
+
+-- | Without donations, deposits, redemptions, mints and withdrawals keep
+-- `A + VA <= S + VS` (at most one unit of asset per unit of share), so a
+-- victim's deposit of any `a >= u` mints at least `a` shares and never zero,
+-- whatever `minOut` it sets. Checked after every step of attacker sequences
+-- from an empty vault and from a vault with one unit of shares, at k = 0
+-- and k = 10. A donation, which raises `A` without shares, can break it;
+-- only the operator adds assets, and only when `S > 0` (D-08).
+test_conversion_t01_noZeroShareDepositWithoutDonations : Script ()
+test_conversion_t01_noZeroShareDepositWithoutDonations = do
+  p <- allocateParty "t01"
+  forA_ [0, 10] $ \k -> forA_ [(0.0, 0.0), (u, oneUnitShares k)] $ \(a0, s0) ->
+    forA_ [1 .. 8] $ \run -> do
+      let start = Attacker with state = viewAt p k a0 s0; held = s0
+          states = statesOf start (take 40 (attackOps (run * 104729 + k)))
+      forA_ states $ \st -> do
+        let v = st.state
+        check "price at most one unit per share" (v.totalAssets + u <= v.totalShares + tenToTheKUnits !! k)
+        let victim = previewDeposit v u
+        check ("victim deposit of u mints " <> show victim) (victim >= u)
+  -- Control: a donation of 3u to a vault with A = 0, S = 0 at k = 0 raises
+  -- the price above one, and a deposit of u then mints zero shares.
+  previewDeposit (viewAt p 0 0.0000000003 0.0) u === 0.0
+
+oneUnitShares : Int -> Decimal
+oneUnitShares k = tenToTheKUnits !! k
+
+-- | The start state and the state after every step.
+statesOf : Attacker -> [(Int, Decimal)] -> [Attacker]
+statesOf start ops = reverse (foldl (\acc op -> attackStep (head acc) op :: acc) [start] ops)
+
+data Attacker = Attacker with
+    state : VaultView
+    held : Decimal
+
+-- | Attacker operations: 0 deposit, 1 redeem, 2 mint, 3 withdraw.
+attackOps : Int -> [(Int, Decimal)]
+attackOps = attackOpsOf 40
+
+attackOpsOf : Int -> Int -> [(Int, Decimal)]
+attackOpsOf n s
+  | n <= 0 = []
+  | otherwise =
+      let s1 = next s
+          s2 = next s1
+      in (s1 % 4, sampleAmount s2 (1 + s2 % 15)) :: attackOpsOf (n - 1) s2
+
+-- | One attacker step; steps the vault would refuse are skipped.
+attackStep : Attacker -> (Int, Decimal) -> Attacker
+attackStep st (op, x) =
+  let v = st.state
+      room = amaxOf v.decimalsOffset - u - v.totalAssets
+  in case op of
+    0 -> let a = min x room; m = previewDeposit v a
+         in if m == 0.0 then st
+            else Attacker with state = (v with totalAssets = v.totalAssets + a; totalShares = v.totalShares + m); held = st.held + m
+    1 -> let s = min x st.held; y = previewRedeem v s
+         in if y == 0.0 || s == 0.0 then st
+            else Attacker with state = (v with totalAssets = v.totalAssets - y; totalShares = v.totalShares - s); held = st.held - s
+    2 -> let s = min x (convertToShares v room); c = previewMint v s
+         in if c == 0.0 || s == 0.0 then st
+            else Attacker with state = (v with totalAssets = v.totalAssets + c; totalShares = v.totalShares + s); held = st.held + s
+    _ -> let a = min x v.totalAssets; b = previewWithdraw v a
+         in if a == 0.0 || b > st.held then st
+            else Attacker with state = (v with totalAssets = v.totalAssets - a; totalShares = v.totalShares - b); held = st.held - b

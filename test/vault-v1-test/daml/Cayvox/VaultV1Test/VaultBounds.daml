@@ -1,0 +1,115 @@
+-- | The `ensure` clauses of the vault templates (`docs/SPEC.md` §4.1 and
+-- §4.2; T-14, T-16): each bound, at the bound and one unit beyond it, at
+-- offsets 0 and 10, and the offsets -1 and 11.
+module Cayvox.VaultV1Test.VaultBounds where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import qualified DA.Text as T
+import qualified DA.TextMap as TextMap
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1 (Metadata (..))
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1
+import Cayvox.VaultV1Test.VaultSetup
+
+u : Decimal
+u = 0.0000000001
+
+textOf : Int -> Text
+textOf n = T.implode (replicate n "a")
+
+metaOf : Int -> Metadata
+metaOf n = Metadata with values = TextMap.fromList [ (show i, "v") | i <- [1 .. n] ]
+
+-- | Totals and offsets: at k = 0 and 10, `A` and `S` at their largest
+-- values and one unit above, and one unit below zero; the offsets 0 and 10
+-- and one beyond each.
+test_vaultState_totalsAndOffset : Script ()
+test_vaultState_totalsAndOffset = do
+  w <- setupWorld "b-totals" Permissioned 0 1
+  (_, v) <- vaultOf w
+  let accepted x = submit w.operator (createCmd x) >>= \cid -> submit w.operator (archiveCmd cid)
+      refused x = trySubmit w.operator (createCmd x) >>= assertFails PreconditionViolated
+  forA_ [ (0, 9999999999999999999999999999.9999999998, 9999999999999999999999999999.9999999998)
+        , (10, 999999999999999999.9999999998, 9999999999999999999999999998.0) ] $ \(k, amax, smax) -> do
+    let at a s = v with decimalsOffset = k; totalAssets = a; totalShares = s
+    accepted (at amax 0.0)
+    refused (at (amax + u) 0.0)
+    accepted (at 0.0 smax)
+    refused (at 0.0 (smax + u))
+    refused (at (-u) 0.0)
+    refused (at 0.0 (-u))
+  refused (v with decimalsOffset = -1)
+  refused (v with decimalsOffset = 11)
+
+-- | Identity and texts: the identifier non-empty and of at most 256
+-- characters; the share instrument and the vault account the operator's;
+-- texts of 256 characters and metadata of 16 entries, and one more.
+test_vaultState_identityAndTexts : Script ()
+test_vaultState_identityAndTexts = do
+  w <- setupWorld "b-identity" Permissioned 0 1
+  let [alice] = w.requesters
+  (_, v) <- vaultOf w
+  let accepted x = submit w.operator (createCmd x) >>= \cid -> submit w.operator (archiveCmd cid)
+      refused x = trySubmit w.operator (createCmd x) >>= assertFails PreconditionViolated
+  refused (v with vaultId = "")
+  accepted (v with vaultId = textOf 245)
+  refused (v with vaultId = textOf 246)
+  refused (v with shareInstrument = v.shareInstrument with admin = alice)
+  refused (v with vaultAccount = v.vaultAccount with owner = Some alice)
+  refused (v with vaultAccount = v.vaultAccount with owner = None)
+  accepted (v with asset = v.asset with id = textOf 256)
+  refused (v with asset = v.asset with id = textOf 257)
+  refused (v with shareInstrument = v.shareInstrument with id = textOf 257)
+  accepted (v with vaultAccount = v.vaultAccount with id = textOf 256)
+  refused (v with vaultAccount = v.vaultAccount with id = textOf 257)
+  accepted (v with meta = metaOf 16)
+  refused (v with meta = metaOf 17)
+
+-- | A vault whose identifier has the largest accepted
+-- length deposits, redeems and adds assets, so every settlement identifier
+-- built from it fits the share registry's bound.
+test_vaultState_longestIdentifierExecutes : Script ()
+test_vaultState_longestIdentifierExecutes = do
+  w0 <- setupWorld "b-long-id" Permissioned 0 1
+  let [alice] = w0.requesters
+      w = w0 with vaultId = textOf 245
+  (cid, v) <- vaultOf w0
+  submit w.operator $ archiveCmd cid
+  _ <- submit w.operator $ createCmd v with vaultId = w.vaultId
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  _ <- run =<< redeemAll w w.operator [(alice, 2.0, False)]
+  _ <- run =<< addAssets w 1.0
+  (_, after) <- vaultOf w
+  (after.totalAssets, after.totalShares) === (9.0, 8.0)
+
+-- | Requests: the vault identifier, both accounts' identifiers and the
+-- metadata, at their bounds and one beyond.
+test_requests_texts : Script ()
+test_requests_texts = do
+  w <- setupWorld "b-requests" Permissioned 0 1
+  let [alice] = w.requesters
+  (d, _) <- newDeposit w alice 1.0 0.0 False
+  (r, _) <- newRedeem w alice 1.0 0.0 False
+  Some dep <- queryContractId alice d
+  Some red <- queryContractId alice r
+  let check x = do
+        submit alice (createCmd x) >>= \cid -> submit alice (archiveCmd cid)
+        pure ()
+      refusedD x = trySubmit alice (createCmd x) >>= assertFails PreconditionViolated
+      long n = dep.payAccount with id = textOf n
+  check (dep with vaultId = textOf 256)
+  refusedD (dep with vaultId = textOf 257)
+  check (dep with payAccount = long 256; receiver = long 256)
+  refusedD (dep with payAccount = long 257)
+  refusedD (dep with receiver = long 257)
+  check (dep with meta = metaOf 16)
+  refusedD (dep with meta = metaOf 17)
+  submit alice (createCmd (red with vaultId = textOf 256)) >>= \cid -> submit alice (archiveCmd cid)
+  trySubmit alice (createCmd (red with vaultId = textOf 257)) >>= assertFails PreconditionViolated
+  trySubmit alice (createCmd (red with payAccount = long 257)) >>= assertFails PreconditionViolated
+  trySubmit alice (createCmd (red with receiver = long 257)) >>= assertFails PreconditionViolated
+  trySubmit alice (createCmd (red with meta = metaOf 17)) >>= assertFails PreconditionViolated

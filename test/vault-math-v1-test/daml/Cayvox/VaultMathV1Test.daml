@@ -1,0 +1,357 @@
+-- | Tests for `Cayvox.VaultMathV1` (`docs/MATH.md`).
+--
+-- Failures are asserted two ways: through the `MathHarness` fixture with
+-- `trySubmit` and the failure helper (`docs/TESTING.md`, section 3), and in
+-- Daml Script with `tryFailureStatus` for tables of vectors.
+module Cayvox.VaultMathV1Test where
+
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import DA.Optional (fromSomeNote)
+import qualified DA.Text as T
+import Daml.Script
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultMathV1
+import Cayvox.VaultMathV1.Internal
+import Cayvox.VaultMathV1Test.EdgeVectors
+import Cayvox.VaultMathV1Test.Fixture
+
+-- Helpers
+----------
+
+u : Decimal
+u = 0.0000000001
+
+negativeOperand : Expected
+negativeOperand = Status "cayvox.com/math-negative-operand" InvalidGivenCurrentSystemStateOther
+
+nonPositiveDivisor : Expected
+nonPositiveDivisor = Status "cayvox.com/math-non-positive-divisor" InvalidGivenCurrentSystemStateOther
+
+overflow : Expected
+overflow = Status "cayvox.com/math-overflow" InvalidGivenCurrentSystemStateOther
+
+-- | The result of a call as `Decimal` text, or the failure's identifier.
+outcome : Rounding -> Decimal -> Decimal -> Decimal -> Script Text
+outcome r a b c = do
+  res <- tryFailureStatus (let x = mulDiv r a b c in pure x)
+  pure (either (.errorId) show res)
+
+-- | Two outcomes are equal: the same identifier, or the same `Decimal`.
+sameOutcome : Text -> Text -> Bool
+sameOutcome got want
+  | T.isPrefixOf "cayvox.com/" got || T.isPrefixOf "cayvox.com/" want = got == want
+  | otherwise = T.parseDecimal got == T.parseDecimal want
+
+assertOutcome : Text -> Rounding -> Decimal -> Decimal -> Decimal -> Text -> Script ()
+assertOutcome label r a b c want = do
+  got <- outcome r a b c
+  if sameOutcome got want
+    then pure ()
+    else abort (label <> ": " <> show r <> " " <> show (a, b, c) <> " gave " <> got <> ", expected " <> want)
+
+dec : Text -> Decimal
+dec t = fromSomeNote ("not a Decimal: " <> t) (T.parseDecimal t)
+
+harness : Text -> Script (Party, ContractId MathHarness)
+harness name = do
+  p <- allocateParty name
+  h <- submit p $ createCmd MathHarness with owner = p
+  pure (p, h)
+
+-- | `mulDiv` in a choice, as a submission result.
+submitMulDiv : (Party, ContractId MathHarness) -> Rounding -> Decimal -> Decimal -> Decimal
+  -> Script (Either SubmitError Decimal)
+submitMulDiv (p, h) rounding a b c =
+  trySubmit p $ exerciseCmd h MathHarness_MulDiv with rounding; a; b; c
+
+-- | `mulDiv` in a choice succeeds with the given result.
+assertSubmitted : (Party, ContractId MathHarness) -> Rounding -> Decimal -> Decimal -> Decimal -> Decimal
+  -> Script ()
+assertSubmitted ph r a b c want = do
+  res <- submitMulDiv ph r a b c
+  case res of
+    Right got | got == want -> pure ()
+    _ -> abort ("expected " <> show want <> " for " <> show (r, a, b, c) <> ", got " <> show res)
+
+-- | The helper rejects a failure against a different identifier.
+assertRejectsWrong : Expected -> Either SubmitError Decimal -> Script ()
+assertRejectsWrong wrong res = case res of
+  Left err | not (matches wrong err) -> pure ()
+  _ -> abort ("the failure helper accepted " <> show wrong)
+
+-- Results
+----------
+
+-- | Every edge vector matches the Python oracle, in both directions.
+test_mulDiv_matchesOracleOnEdgeVectors : Script ()
+test_mulDiv_matchesOracleOnEdgeVectors = forA_ edgeVectors $ \v -> do
+  let (wantFloor, wantCeil) = case T.splitOn "|" v.expected of
+        [f, c] -> (f, c)
+        _ -> error ("malformed expectation: " <> v.expected)
+  assertOutcome v.label Floor (dec v.a) (dec v.b) (dec v.c) wantFloor
+  assertOutcome v.label Ceil (dec v.a) (dec v.b) (dec v.c) wantCeil
+
+-- | Floor rounds down and Ceil rounds up, where Decimal division rounds
+-- half-even.
+test_mulDiv_roundsInTheRequestedDirection : Script ()
+test_mulDiv_roundsInTheRequestedDirection = do
+  assertOutcome "1/3" Floor 1.0 1.0 3.0 "0.3333333333"
+  assertOutcome "1/3" Ceil 1.0 1.0 3.0 "0.3333333334"
+  assertOutcome "2/3" Floor 2.0 1.0 3.0 "0.6666666666"
+  assertOutcome "2/3" Ceil 2.0 1.0 3.0 "0.6666666667"
+  assertOutcome "u/2" Floor u 1.0 2.0 "0.0"
+  assertOutcome "u/2" Ceil u 1.0 2.0 "0.0000000001"
+
+-- | Both directions agree when the division is exact (M-04).
+test_mulDiv_isExactWhenDivisible : Script ()
+test_mulDiv_isExactWhenDivisible = do
+  assertOutcome "6*7/3" Floor 6.0 7.0 3.0 "14.0"
+  assertOutcome "6*7/3" Ceil 6.0 7.0 3.0 "14.0"
+  assertOutcome "a*c/c" Floor 123.4567890123 98765.4321 98765.4321 "123.4567890123"
+  assertOutcome "a*c/c" Ceil 123.4567890123 98765.4321 98765.4321 "123.4567890123"
+
+-- | A product beyond the Decimal range does not fail by itself.
+test_mulDiv_productBeyondDecimalRangeIsExact : Script ()
+test_mulDiv_productBeyondDecimalRangeIsExact = do
+  assertOutcome "DMAX*DMAX/DMAX" Floor dmax dmax dmax (show dmax)
+  assertOutcome "DMAX*DMAX/DMAX" Ceil dmax dmax dmax (show dmax)
+  assertOutcome "1e20*1e20/1e25" Floor 100000000000000000000.0 100000000000000000000.0 10000000000000000000000000.0 "1000000000000000.0"
+  assertOutcome "DMAX*DMAX/(DMAX-u) is DMAX + u + a fraction" Floor dmax dmax (dmax - u) "cayvox.com/math-overflow"
+
+-- | M-03, M-06 and M-07 on sample operands.
+test_mulDiv_propertiesHoldOnSamples : Script ()
+test_mulDiv_propertiesHoldOnSamples = do
+  let samples =
+        [ (1.0, 1.0, 3.0), (u, u, 7.0), (dmax, 0.5, 0.7), (123456.789, 0.0000314159, 2.7182818284)
+        , (99999999999.9999999999, 99999999999.9999999999, 1234567890.0987654321), (0.0, dmax, u) ]
+  forA_ samples $ \(a, b, c) -> do
+    let f = mulDiv Floor a b c
+        g = mulDiv Ceil a b c
+    if f <= g && g <= f + u then pure () else abort ("M-03 fails for " <> show (a, b, c))
+    if mulDiv Floor b a c == f && mulDiv Ceil b a c == g then pure () else abort ("M-06 fails for " <> show (a, b, c))
+    if mulDiv Floor a c c == a && mulDiv Ceil a c c == a then pure () else abort ("M-07 fails for " <> show (a, c))
+
+-- Failures (docs/MATH.md, section 4)
+------------------------------------
+
+-- | `a` at zero and one unit succeeds; one unit below zero fails.
+test_mulDiv_failsWhenFirstOperandNegative : Script ()
+test_mulDiv_failsWhenFirstOperandNegative = do
+  ph <- harness "math-a"
+  assertSubmitted ph Floor 0.0 1.0 1.0 0.0
+  assertSubmitted ph Ceil u 1.0 1.0 u
+  res <- submitMulDiv ph Floor (-u) 1.0 1.0
+  assertFails negativeOperand res
+  assertRejectsWrong overflow res
+  submitMulDiv ph Ceil (negate dmax) 1.0 1.0 >>= assertFails negativeOperand
+
+-- | `b` at zero and one unit succeeds; one unit below zero fails.
+test_mulDiv_failsWhenSecondOperandNegative : Script ()
+test_mulDiv_failsWhenSecondOperandNegative = do
+  ph <- harness "math-b"
+  assertSubmitted ph Floor 1.0 0.0 1.0 0.0
+  assertSubmitted ph Ceil 1.0 u 1.0 u
+  res <- submitMulDiv ph Ceil 1.0 (-u) 1.0
+  assertFails negativeOperand res
+  assertRejectsWrong nonPositiveDivisor res
+
+-- | `c` at one unit succeeds; zero and one unit below zero fail.
+test_mulDiv_failsWhenDivisorNotPositive : Script ()
+test_mulDiv_failsWhenDivisorNotPositive = do
+  ph <- harness "math-c"
+  assertSubmitted ph Floor u 1.0 u 1.0
+  assertSubmitted ph Ceil 1.0 1.0 u 10000000000.0
+  res <- submitMulDiv ph Floor 1.0 1.0 0.0
+  assertFails nonPositiveDivisor res
+  assertRejectsWrong negativeOperand res
+  submitMulDiv ph Ceil 1.0 1.0 (-u) >>= assertFails nonPositiveDivisor
+  submitMulDiv ph Floor 0.0 0.0 0.0 >>= assertFails nonPositiveDivisor
+
+-- | Results at DMAX succeed; one unit above fails, in each direction. With
+-- b = 1.0000000001 and c = 1.0, the three first operands give exact
+-- results just below, just at and just above DMAX (oracle vectors "fit").
+test_mulDiv_failsWhenResultExceedsDmax : Script ()
+test_mulDiv_failsWhenResultExceedsDmax = do
+  ph <- harness "math-overflow"
+  let b = 1.0000000001
+      below = 9999999999000000000099999999.9899999999
+      at = 9999999999000000000099999999.99
+      above = 9999999999000000000099999999.9900000001
+  assertSubmitted ph Floor below b 1.0 (dmax - u)
+  assertSubmitted ph Ceil below b 1.0 dmax
+  assertSubmitted ph Floor at b 1.0 dmax
+  res <- submitMulDiv ph Ceil at b 1.0
+  assertFails overflow res
+  assertRejectsWrong negativeOperand res
+  submitMulDiv ph Floor above b 1.0 >>= assertFails overflow
+  assertSubmitted ph Floor dmax 1.0 1.0 dmax
+  submitMulDiv ph Floor dmax dmax u >>= assertFails overflow
+
+-- | The first failing check determines the failure, in the order of the
+-- table in `docs/MATH.md`, section 4.
+test_mulDiv_failureOrderFollowsTheTable : Script ()
+test_mulDiv_failureOrderFollowsTheTable = do
+  ph <- harness "math-order"
+  submitMulDiv ph Floor (-u) 1.0 0.0 >>= assertFails negativeOperand
+  submitMulDiv ph Ceil 1.0 (-1.0) (-1.0) >>= assertFails negativeOperand
+  submitMulDiv ph Floor (negate dmax) dmax u >>= assertFails negativeOperand
+  submitMulDiv ph Floor dmax dmax 0.0 >>= assertFails nonPositiveDivisor
+
+-- | A failing call bound by `let` fails even when its value is unused
+-- (`docs/MATH.md`, section 4).
+test_mulDiv_unusedFailingCallStillFails : Script ()
+test_mulDiv_unusedFailingCallStillFails = do
+  res <- tryFailureStatus (let _unused = mulDiv Floor 1.0 1.0 0.0 in pure ())
+  case res of
+    Left fs | fs.errorId == "cayvox.com/math-non-positive-divisor" -> pure ()
+    _ -> abort ("expected math-non-positive-divisor, got " <> show res)
+
+-- Limbs (Cayvox.VaultMathV1.Internal)
+--------------------------------------
+
+-- | Conversion to limbs is exact and round-trips.
+test_toLimbs_isExactAndRoundTrips : Script ()
+test_toLimbs_isExactAndRoundTrips = do
+  let check label got want = if got == want then pure () else abort (label <> ": " <> show got)
+  check "0" (toLimbs 0.0) []
+  check "u" (toLimbs u) [1]
+  check "1" (toLimbs 1.0) [0, 10]
+  check "0.1" (toLimbs 0.1) [0, 1]
+  check "DMAX" (toLimbs dmax) dmaxLimbs
+  check "limb boundary" (toLimbs 0.0999999999) [999999999]
+  check "limb boundary + u" (toLimbs 0.1) [0, 1]
+  forA_ [0.0, u, 0.1, 1.0, 123.456, 99999999.9999999999, 100000000.0, dmax - u, dmax] $ \x ->
+    check ("round trip " <> show x) (fromLimbs (toLimbs x)) (Some x)
+  check "above DMAX" (fromLimbs (addLimbs dmaxLimbs [1])) None
+  check "compare" (compareLimbs [0, 1] [999999999]) GT
+
+-- | `natToNumeric0` builds each integer exactly: zero, one, both sides of
+-- every power of two it needs, and the largest limb. Compared with Numeric 0
+-- literals, which the Daml-LF specification defines exactly.
+test_natToNumeric0_isExact : Script ()
+test_natToNumeric0_isExact = do
+  let cases : [(Int, Numeric 0)] =
+        [ (0, 0.0), (1, 1.0), (2, 2.0), (3, 3.0), (7, 7.0), (8, 8.0), (9, 9.0)
+        , (1023, 1023.0), (1024, 1024.0), (1025, 1025.0)
+        , (536870911, 536870911.0), (536870912, 536870912.0)
+        , (999999999, 999999999.0), (1000000000, 1000000000.0) ]
+  forA_ cases $ \(n, want) ->
+    if natToNumeric0 n == want then pure () else abort ("natToNumeric0 " <> show n <> " = " <> show (natToNumeric0 n))
+
+-- | `limbValue` places the largest limb at every position exactly.
+test_limbValue_placesEachPosition : Script ()
+test_limbValue_placesEachPosition = do
+  let top = 999999999
+      cases =
+        [ (0, top, 0.0999999999), (1, top, 99999999.9), (2, top, 99999999900000000.0)
+        , (3, top, 99999999900000000000000000.0), (4, 99, 9900000000000000000000000000.0)
+        , (0, 1, 0.0000000001), (4, 1, 100000000000000000000000000.0) ]
+  forA_ cases $ \(i, l, want) ->
+    if limbValue i l == want then pure () else abort ("limbValue " <> show i <> " " <> show l)
+
+-- | `toLimbs` at every limb boundary, each one unit below, at, and one unit
+-- above the boundary.
+test_toLimbs_limbBoundaries : Script ()
+test_toLimbs_limbBoundaries = do
+  let cases =
+        [ (0.0999999999, [999999999]), (0.1, [0, 1]), (0.1000000001, [1, 1])
+        , (99999999.9999999999, [999999999, 999999999]), (100000000.0, [0, 0, 1])
+        , (100000000.0000000001, [1, 0, 1])
+        , (99999999999999999.9999999999, [999999999, 999999999, 999999999])
+        , (100000000000000000.0, [0, 0, 0, 1])
+        , (99999999999999999999999999.9999999999, [999999999, 999999999, 999999999, 999999999])
+        , (100000000000000000000000000.0, [0, 0, 0, 0, 1])
+        , (dmax, dmaxLimbs), (dmax - u, [999999998, 999999999, 999999999, 999999999, 99]) ]
+  forA_ cases $ \(x, want) ->
+    if toLimbs x == want && fromLimbs want == Some x then pure () else abort ("toLimbs " <> show x <> " = " <> show (toLimbs x))
+
+-- | For every edge vector, the quotient and remainder of the limb division
+-- rebuild the product, with the remainder below the divisor. This observes
+-- the quotient also where the rounded result would overflow.
+test_divModLimbs_rebuildsTheDividend : Script ()
+test_divModLimbs_rebuildsTheDividend = forA_ edgeVectors $ \v -> do
+  let (a, b, c) = (dec v.a, dec v.b, dec v.c)
+  if a < 0.0 || b < 0.0 || c <= 0.0 then pure () else do
+    let p = mulLimbs (toLimbs a) (toLimbs b)
+        cl = toLimbs c
+        (q, r) = divModLimbs p cl
+    if compareLimbs (addLimbs (mulLimbs q cl) r) p == EQ && compareLimbs r cl == LT
+      then pure ()
+      else abort (v.label <> ": q = " <> show q <> ", r = " <> show r)
+
+-- Bounds (packages/utils/vault-math-v1/ARCHITECTURE.md, section 6)
+--------------------------------------------------------------------
+
+-- | `KMAX` of `docs/MATH.md`, section 7 (D-10).
+kmax : Int
+kmax = 10
+
+-- | `10^k * u`, the virtual shares `VS` for offset `k`; `VA` is `u`.
+virtualShares : Int -> Decimal
+virtualShares k = intToDecimal (10 ^ k) * u
+
+-- | `AMAX(k) = floor(DMAX / 10^k)`, exactly.
+assetCap : Int -> Decimal
+assetCap k = mulDiv Floor dmax u (virtualShares k)
+
+-- | The asset bound for a new total `a`, `a + VA <= AMAX(k)`, in the form
+-- that cannot overflow: `a <= AMAX(k) - VA` (at `k = 0`, `a + VA` exceeds
+-- DMAX when `a = DMAX`).
+withinAssetBound : Int -> Decimal -> Bool
+withinAssetBound k a = a <= assetCap k - u
+
+-- | The share bound for a new total `s`, `s + VS <= 10^k * AMAX(k)`, in the
+-- form that cannot overflow: `s <= 10^k * AMAX(k) - VS`.
+withinShareBound : Int -> Decimal -> Bool
+withinShareBound k s = s <= mulDiv Floor (assetCap k) (virtualShares k) u - virtualShares k
+
+-- | At offset `k`, with `AMAX(k)` and the shares of the largest first
+-- deposit from the capacity table: that deposit mints exactly those shares
+-- through a choice, both bounds hold one unit below it and at it, the asset
+-- bound fails one unit above it, and the share bound never exceeds DMAX.
+-- For `k >= 1`, the previous bound (`A <= DMAX - VA`) would have allowed a
+-- first deposit that overflows.
+assertBoundsAt : Int -> Decimal -> Decimal -> Script ()
+assertBoundsAt k amax largestShares = do
+  ph <- harness ("math-bounds-" <> show k)
+  let vs = virtualShares k
+      largest = amax - u
+      check label cond = if cond then pure () else abort ("k = " <> show k <> ": " <> label)
+  check "AMAX(k) matches the capacity table" (assetCap k == amax)
+  assertSubmitted ph Floor largest vs u largestShares
+  check "one unit below: both bounds" (withinAssetBound k (largest - u) && withinShareBound k (mulDiv Floor (largest - u) vs u))
+  check "at the capacity: both bounds" (withinAssetBound k largest && withinShareBound k largestShares)
+  check "one unit above: the asset bound fails" (not (withinAssetBound k (largest + u)))
+  check "the share bound is at most DMAX" (mulDiv Floor amax vs u <= dmax)
+  if k >= 1 then submitMulDiv ph Floor (dmax - u) vs u >>= assertFails overflow else pure ()
+
+-- | Offset 0, the default.
+test_bounds_offsetZero : Script ()
+test_bounds_offsetZero =
+  assertBoundsAt 0 9999999999999999999999999999.9999999999 9999999999999999999999999999.9999999998
+
+-- | Offset `KMAX = 10`.
+test_bounds_offsetKmax : Script ()
+test_bounds_offsetKmax = do
+  if kmax == 10 then pure () else abort "KMAX changed; update the capacity table"
+  assertBoundsAt 10 999999999999999999.9999999999 9999999999999999999999999998.0000000000
+
+-- | Offset `KMAX + 1 = 11`: the arithmetic still fits, so `KMAX` is a policy
+-- bound (D-10), not an arithmetic one. The vault rejects `k = 11` in its
+-- `ensure` (`docs/SPEC.md`, section 4.1).
+test_bounds_offsetKmaxPlusOne : Script ()
+test_bounds_offsetKmaxPlusOne =
+  assertBoundsAt 11 99999999999999999.9999999999 9999999999999999999999999980.0000000000
+
+-- | V-04: with `A = 0` and `S = 0`, the first deposit of `a` mints
+-- `a * 10^k`, for every offset up to 10 and amounts that fit.
+test_mulDiv_firstDepositMintsTenToTheK : Script ()
+test_mulDiv_firstDepositMintsTenToTheK =
+  forA_ [0 .. 10] $ \k ->
+    forA_ [u, 1.0, 123.4567890123, 99999999.9999999999] $ \a -> do
+      let want = a * intToDecimal (10 ^ k)
+      if mulDiv Floor a (virtualShares k) u == want
+        then pure ()
+        else abort ("V-04 fails for k = " <> show k <> ", a = " <> show a)

@@ -1,0 +1,200 @@
+-- | Helpers of the vault templates in `Cayvox.VaultV1`: the legs and the
+-- settlement of a request (`docs/SPEC.md` §4.2), the allocations the vault
+-- and the request create, and the checks of the state and of a request.
+module Cayvox.VaultV1.Internal.Vault
+  ( Kind (..)
+  , maxBatchSize
+  , requestSettlement
+  , addAssetsSettlement
+  , inLeg
+  , outLeg
+  , addAssetsLeg
+  , allocationSpec
+  , allocateAt
+  , allocateWithChange
+  , settleAt
+  , sameTemplate
+  , fundingMatches
+  , shareCap
+  , validState
+  , requestValid
+  , boundedAccountId
+  , unique
+  ) where
+
+import DA.Fail (failWithStatusPure)
+import DA.Optional (fromOptional, isNone)
+import qualified DA.Set as Set
+import qualified DA.TextMap as TextMap
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2 (Account (..), Holding, InstrumentId (..))
+import Splice.Api.Token.MetadataV1
+
+import Cayvox.VaultMathV1 (Rounding (..), mulDiv)
+import Cayvox.VaultV1.Internal.Conversion (assetCap, kmax, unit, virtualShares)
+import Cayvox.VaultV1.Internal.Failure
+import Cayvox.VaultV1.Internal.ShareRegistry (boundedText)
+import Cayvox.VaultV1.Internal.TokenStandard (burnAccount, mintAccount, nonIteratedAllocation, senderSide)
+
+-- | A deposit or a redemption.
+data Kind = Deposit | Redeem
+  deriving (Eq, Show)
+
+-- | The most requests in one execution (D-16; `docs/SPEC.md` §5.3 step 3).
+maxBatchSize : Int
+maxBatchSize = 25
+
+-- | The settlement of a request (`docs/SPEC.md` §4.2): executed by the operator,
+-- identified by the vault and the kind, bound by the request's contract ID.
+requestSettlement : Party -> Text -> Kind -> AnyContractId -> SettlementInfo
+requestSettlement operator vaultId kind request = SettlementInfo with
+  executors = [operator]
+  id = vaultId <> (if kind == Deposit then "/deposit" else "/redeem")
+  cid = Some request
+  meta = emptyMetadata
+
+-- | The settlement of an asset addition, bound by the vault state's
+-- contract ID (`docs/SPEC.md` §5.5).
+addAssetsSettlement : Party -> Text -> AnyContractId -> SettlementInfo
+addAssetsSettlement operator vaultId vault = SettlementInfo with
+  executors = [operator]
+  id = vaultId <> "/add-assets"
+  cid = Some vault
+  meta = emptyMetadata
+
+-- | The leg the requester sends: underlying into the vault's account for a
+-- deposit, shares into `cip-112/burn` for a redemption.
+inLeg : Kind -> Account -> InstrumentId -> InstrumentId -> Account -> Decimal -> TransferLeg
+inLeg kind vaultAccount asset shareInstrument payAccount amount = TransferLeg with
+  transferLegId = "in"
+  sender = payAccount
+  receiver = if kind == Deposit then vaultAccount else burnAccount
+  amount
+  instrumentId = (if kind == Deposit then asset else shareInstrument).id
+  meta = emptyMetadata
+
+-- | The leg the requester receives, for the amount the vault computes:
+-- shares from `cip-112/mint` for a deposit, underlying from the vault's
+-- account for a redemption.
+outLeg : Kind -> Account -> InstrumentId -> InstrumentId -> Account -> Decimal -> TransferLeg
+outLeg kind vaultAccount asset shareInstrument receiver amount = TransferLeg with
+  transferLegId = "out"
+  sender = if kind == Deposit then mintAccount else vaultAccount
+  receiver
+  amount
+  instrumentId = (if kind == Deposit then shareInstrument else asset).id
+  meta = emptyMetadata
+
+-- | The leg of an asset addition, from `source` into the vault's account.
+addAssetsLeg : Account -> InstrumentId -> Account -> Decimal -> TransferLeg
+addAssetsLeg vaultAccount asset source amount = TransferLeg with
+  transferLegId = "add"
+  sender = source
+  receiver = vaultAccount
+  amount
+  instrumentId = asset.id
+  meta = emptyMetadata
+
+-- | A single-leg-side allocation specification, never iterated.
+allocationSpec : Party -> Account -> TransferLegSide -> Optional Time -> Bool -> AllocationSpecification
+allocationSpec admin authorizer legSide settlementDeadline committed = AllocationSpecification with
+  admin
+  authorizer
+  transferLegSides = [legSide]
+  settlementDeadline
+  nextIterationFunding = None
+  committed
+  meta = emptyMetadata
+
+-- | Allocate at a factory with the given actor. A registry that answers with
+-- an allocation instruction instead of an allocation fails the execution
+-- with `vault-allocation-mismatch`, because the settlement needs the
+-- allocation itself.
+allocateAt
+  : ContractId AllocationFactory -> SettlementInfo -> AllocationSpecification -> [ContractId Holding]
+  -> ExtraArgs -> Party -> Update (ContractId Allocation)
+allocateAt factory settlement allocation inputHoldingCids extraArgs actor =
+  fst <$> allocateWithChange factory settlement allocation inputHoldingCids extraArgs actor ""
+
+-- | `allocateAt`, also returning the holdings of instrument `instrument`
+-- that the registry returned to the authorizer: the change and every input
+-- it did not use (`authorizerChangeCids`, keyed by `instrumentId.id`;
+-- Splice 0.8.4 `AllocationInstructionV2.daml:163-167`, `:199-203`).
+allocateWithChange
+  : ContractId AllocationFactory -> SettlementInfo -> AllocationSpecification -> [ContractId Holding]
+  -> ExtraArgs -> Party -> Text -> Update (ContractId Allocation, [ContractId Holding])
+allocateWithChange factory settlement allocation inputHoldingCids extraArgs actor instrument = do
+  now <- getTime
+  res <- exercise factory AllocationFactory_Allocate with
+    settlement
+    allocation
+    requestedAt = now
+    inputHoldingCids
+    extraArgs
+    actors = [actor]
+  case res.output of
+    AllocationInstructionResult_Completed {allocationCid} ->
+      pure (allocationCid, fromOptional [] (TextMap.lookup instrument res.authorizerChangeCids))
+    _ -> raise vaultAllocationMismatch
+
+-- | Settle one leg with its two allocations at a factory, as the operator.
+settleAt
+  : ContractId SettlementFactory -> SettlementInfo -> TransferLeg -> [ContractId Allocation]
+  -> ExtraArgs -> Party -> Update ()
+settleAt factory settlement leg allocations extraArgs operator = do
+  _ <- exercise factory SettlementFactory_SettleBatch with
+    settlement
+    transferLegs = [leg]
+    allocations = map nonIteratedAllocation allocations
+    actors = [operator]
+    extraArgs
+  pure ()
+
+-- | Whether two allocations are contracts of the same template
+-- (`interface_typerep`; `docs/SPEC.md` §5.3, template identity).
+sameTemplate : ContractId Allocation -> ContractId Allocation -> Update Bool
+sameTemplate a b = do
+  x <- fetch a
+  y <- fetch b
+  pure (interfaceTypeRep x == interfaceTypeRep y)
+
+-- | Whether a requester's funding allocation, as its view reports it, is
+-- bound to the request (`docs/SPEC.md` §5.3 step 7).
+fundingMatches : AllocationView -> SettlementInfo -> Party -> Account -> TransferLeg -> Time -> Bool
+fundingMatches v settlement admin payAccount leg deadline =
+  v.settlement == settlement
+    && v.allocation.admin == admin
+    && v.allocation.authorizer == payAccount
+    && v.allocation.transferLegSides == [senderSide leg]
+    && v.allocation.settlementDeadline == Some deadline
+    && isNone v.allocation.nextIterationFunding
+
+-- | `10^k * AMAX(k)`, the share bound's limit, for `0 <= k <= KMAX`.
+shareCap : Int -> Decimal
+shareCap k = mulDiv Floor (assetCap k) (virtualShares k) unit
+
+-- | The state constraints of `docs/SPEC.md` §4.1 that depend on the offset:
+-- `0 <= k <= KMAX`, `A` and `S` not negative, the asset bound and the share
+-- bound, evaluated so that nothing overflows.
+validState : Int -> Decimal -> Decimal -> Bool
+validState k a s
+  | k < 0 || k > kmax = False
+  | a < 0.0 || s < 0.0 = False
+  | otherwise = a <= assetCap k - unit && s <= shareCap k - virtualShares k
+
+-- | `amount > 0` and `minOut >= 0`, else `vault-invalid-amount` (`docs/SPEC.md`
+-- §4.2 and §7); used in a request's `ensure`.
+requestValid : Decimal -> Decimal -> Bool
+requestValid amount minOut
+  | amount > 0.0 && minOut >= 0.0 = True
+  | otherwise = failWithStatusPure vaultInvalidAmount
+
+-- | An account identifier within the text bound.
+boundedAccountId : Account -> Bool
+boundedAccountId account = boundedText account.id
+
+-- | Whether a list has no repeated element.
+unique : Ord a => [a] -> Bool
+unique xs = Set.size (Set.fromList xs) == length xs

@@ -1,0 +1,72 @@
+-- | Executions submitted near their deadline on a
+-- wall-clock synchronizer. For each offset, a deposit request gets a
+-- deadline, the script waits until the deadline minus the offset, and the
+-- operator submits the execution together with `ClockProbe_Now`, so the one
+-- transaction reports the ledger time the vault compared with the deadline.
+-- Run on a sandbox through `dpm script`. Not a test: it takes an
+-- input.
+module Cayvox.VaultV1Test.R22
+  ( R22Input (..)
+  , ClockProbe (..)
+  , ClockProbe_Now (..)
+  , probeR22
+  ) where
+
+import qualified DA.Text as T
+import DA.Time (RelTime, addRelTime, convertMicrosecondsToRelTime, convertRelTimeToMicroseconds, subTime)
+import Daml.Script
+
+import Cayvox.VaultV1
+import Cayvox.VaultV1Test.VaultSetup
+
+-- | Offsets before the deadline in milliseconds (negative: after it).
+data R22Input = R22Input with
+    offsetsMillis : [Int]
+    tag : Text
+  deriving (Eq, Show)
+
+-- | Reports the ledger time of the transaction that exercises it.
+template ClockProbe
+  with
+    owner : Party
+  where
+    signatory owner
+
+    nonconsuming choice ClockProbe_Now : Time
+      controller owner
+      do getTime
+
+millis : Int -> RelTime
+millis n = convertMicrosecondsToRelTime (n * 1000)
+
+micros : RelTime -> Int
+micros = convertRelTimeToMicroseconds
+
+probeR22 : R22Input -> Script [Text]
+probeR22 input = do
+  w <- setupWorldWith ("r22-" <> input.tag) Permissioned 0 (length input.offsetsMillis) 100.0
+  probe <- submit w.operator $ createCmd ClockProbe with owner = w.operator
+  forA (zip w.requesters input.offsetsMillis) $ \(p, offset) -> do
+    start <- getTime
+    let deadline = addRelTime start (millis (abs offset + 4000))
+        target = addRelTime deadline (millis (negate offset))
+    r <- newDepositUntil w p 10.0 0.0 False deadline
+    i <- depositItem w p r
+    s <- executeDeposits w w.operator [(p, i)]
+    before <- getTime
+    let wait = subTime target before
+    if micros wait > 0 then sleep wait else pure ()
+    sent <- getTime
+    res <- trySubmit (actAs s.submitter <> discloseMany s.disclosures) $
+      (,) <$> s.commands <*> exerciseCmd probe ClockProbe_Now
+    done <- getTime
+    let field k v = k <> "=" <> v
+        common =
+          [ field "offsetMs" (show offset)
+          , field "sentBeforeDeadlineUs" (show (micros (subTime deadline sent)))
+          , field "roundTripUs" (show (micros (subTime done sent))) ]
+    pure $ T.intercalate " " $ case res of
+      Right (_, ledgerTime) ->
+        common ++ [ "executed", field "ledgerTimeBeforeDeadlineUs" (show (micros (subTime deadline ledgerTime)))
+                  , field "ledgerTimeAfterSendUs" (show (micros (subTime ledgerTime sent))) ]
+      Left e -> common ++ [ "refused", field "error" (T.take 300 (show e)) ]

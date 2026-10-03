@@ -1,0 +1,51 @@
+-- | Tests for `Cayvox.Api.VaultV1`: the interface is implementable and its
+-- view is read through it.
+module Cayvox.Api.VaultV1Test where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import qualified DA.TextMap as TextMap
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2 (InstrumentId (..))
+import Splice.Api.Token.MetadataV1 (Metadata (..))
+
+import Cayvox.Api.VaultV1
+
+-- | A test template that reports a fixed view.
+template ViewFixture
+  with
+    owner : Party
+    reported : VaultView
+  where
+    signatory owner
+
+    interface instance Vault for ViewFixture where
+      view = reported
+
+-- | The production DAR resolves as a data dependency and its public module
+-- imports.
+test_publicModuleImports : Script ()
+test_publicModuleImports = pure ()
+
+-- | A contract implementing `Vault` is read through the interface, and its
+-- view carries every field of D-12 unchanged, for both modes.
+test_vaultView_readsThroughInterface : Script ()
+test_vaultView_readsThroughInterface = do
+  operator <- allocateParty "operator-api"
+  let instrument id = InstrumentId with admin = operator; id
+      reported mode = VaultView with
+        operator
+        vaultId = "vault-api"
+        asset = instrument "underlying"
+        shareInstrument = instrument "vault-api"
+        totalAssets = 100.0
+        totalShares = 250.0000000001
+        decimalsOffset = 10
+        mode
+        paused = True
+        meta = Metadata with values = TextMap.fromList [("example.com/key", "value")]
+  forA_ [Permissioned, Permissionless] $ \mode -> do
+    cid <- submit operator $ createCmd ViewFixture with owner = operator; reported = reported mode
+    Some v <- queryInterfaceContractId operator (toInterfaceContractId @Vault cid)
+    v === reported mode

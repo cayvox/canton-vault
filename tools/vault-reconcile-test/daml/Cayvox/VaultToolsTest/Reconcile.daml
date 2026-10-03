@@ -1,0 +1,117 @@
+-- | Tests of the reconciliation tool: it passes honest runs and reports
+-- T-10 (custody moved), T-11 (totals rewritten) and T-13 (shares minted
+-- outside the vault). The vaults are built with the vault tests' fixtures;
+-- the journal is the vault account's flow in each execution's transaction,
+-- as the operator's application reads it from its transaction stream.
+module Cayvox.VaultToolsTest.Reconcile where
+
+import DA.Assert ((===), (=/=))
+import DA.Optional (fromSome)
+import qualified DA.Text as T
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+import qualified Splice.Api.Token.TransferInstructionV2 as V2T
+import Splice.Testing.Tokens.TestTokenV2.Transfer (TokenTransferOffer)
+
+import Cayvox.VaultTools.Reconcile
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup hiding (reconcile)
+
+-- | The tool's report for a world, a journal and donations.
+report : World -> Decimal -> Decimal -> Script Report
+report w journal donations =
+  reconcile ReconcileInput with operator = w.operator; vaultId = w.vaultId; journal; donations; baseline = None
+
+-- | Whether some finding starts with the prefix.
+reports : Text -> Report -> Bool
+reports prefix r = any (T.isPrefixOf prefix) r.findings
+
+-- | Deposits, a redemption and a donation reconcile.
+test_tool_honestRunReconciles : Script ()
+test_tool_honestRunReconciles = do
+  w <- setupWorld "tool-honest" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  j1 <- journaled w =<< depositAll w w.operator [(alice, 100.0, False), (bob, 50.0, False)]
+  j2 <- journaled w =<< redeemAll w w.operator [(alice, 30.0, False)]
+  mintUnderlying w.underlying w.operator 7.0
+  r <- report w (j1 + j2) 7.0
+  r.findings === []
+  (r.recordedAssets, r.recordedShares, r.shareSupply, r.custody) === (120.0, 120.0, 120.0, 127.0)
+
+-- | T-11: the operator archives the vault state and creates it with other
+-- totals.
+test_tool_detectsRewrittenTotals : Script ()
+test_tool_detectsRewrittenTotals = do
+  w <- setupWorld "tool-t11" Permissioned 0 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  (cid, v) <- vaultOf w
+  submit w.operator $ archiveCmd cid
+  _ <- submit w.operator $ createCmd v with totalAssets = 150.0; totalShares = 150.0
+  r <- report w j 0.0
+  r.findings =/= []
+  assertMsg ("I-01 reported: " <> show r) (reports "I-01" r)
+  assertMsg ("I-02 reported: " <> show r) (reports "I-02" r)
+
+-- | T-13: the operator mints shares outside every vault execution.
+test_tool_detectsOutsideMint : Script ()
+test_tool_detectsOutsideMint = do
+  w <- setupWorld "tool-r25" Permissioned 0 1
+  let [alice] = w.requesters
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  _ <- S.mintShares w.shares alice 50.0 "outside"
+  r <- report w j 0.0
+  r.findings === ["I-02: totalShares 100.0 differs from the share supply 150.0"]
+
+-- | T-10: the operator moves underlying out of the vault account outside
+-- every vault choice.
+test_tool_detectsCustodyMove : Script ()
+test_tool_detectsCustodyMove = do
+  w <- setupWorld "tool-t10" Permissioned 0 1
+  let [alice] = w.requesters
+  receiver <- allocateParty "receiver-tool-t10"
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  inputs <- underlyingHoldings w.underlying w.operator
+  d <- underlyingDisclosure w.underlying
+  now <- getTime
+  res <- submit (actAs w.operator <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2T.TransferFactory w.underlying.rules) V2T.TransferFactory_Transfer with
+      transfer = V2T.Transfer with
+        sender = basicAccount w.operator; receiver = basicAccount receiver; amount = 60.0
+        instrumentId = underlyingInstrument w.underlying; requestedAt = now
+        executeBefore = addRelTime now (days 1); inputHoldingCids = inputs; meta = emptyMetadata
+      actors = [w.operator]; extraArgs = underlyingArgs w.underlying
+  offer <- case res.output of
+    V2T.TransferInstructionResult_Pending {transferInstructionCid} -> pure transferInstructionCid
+    other -> abort ("transfer not pending: " <> show other)
+  offerD <- fromSome <$> queryDisclosure @TokenTransferOffer w.operator (coerceContractId offer)
+  heldD <- tokenDisclosures w.operator =<< map fst <$> accountHoldings w.underlying (basicAccount w.operator)
+  _ <- submit (actAs receiver <> discloseMany (d :: offerD :: heldD)) $
+    exerciseCmd offer V2T.TransferInstruction_Accept with actors = [receiver]; extraArgs = underlyingArgs w.underlying
+  r <- report w j 0.0
+  r.findings === ["custody: the vault account holds 40.0, the journal and donations 100.0"]
+
+
+-- | A vault state recreated with the same totals but another decimals
+-- offset reconciles on its totals, and is reported against the baseline.
+test_tool_detectsChangedIdentity : Script ()
+test_tool_detectsChangedIdentity = do
+  w <- setupWorld "tool-identity" Permissioned 0 1
+  let [alice] = w.requesters
+  (_, v0) <- vaultOf w
+  j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
+  let input = ReconcileInput with
+        operator = w.operator; vaultId = w.vaultId; journal = j; donations = 0.0; baseline = Some (identityOf v0)
+  honest <- reconcile input
+  honest.findings === []
+  (cid, v) <- vaultOf w
+  submit w.operator $ archiveCmd cid
+  _ <- submit w.operator $ createCmd v with decimalsOffset = 1
+  r <- reconcile input
+  assertMsg ("identity reported: " <> show r) (reports "identity" r)
+  (r.recordedAssets, r.recordedShares, r.shareSupply) === (100.0, 100.0, 100.0)

@@ -1,0 +1,404 @@
+-- | Differential tests: each of the twenty token-standard functions in
+-- `Cayvox.VaultV1.Internal.TokenStandard` against its counterpart in
+-- `splice-token-standard-utils` 2.0.0 (D-07). Pure functions are compared
+-- value for value; `Update` functions run on both sides inside a harness
+-- choice and are compared on success or failure and on their results.
+-- Documented differences are asserted as differences.
+module Cayvox.VaultV1Test.Differential where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import qualified DA.TextMap as TextMap
+import DA.Time (addRelTime, microseconds, seconds)
+import Daml.Script
+
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferEventsV2 as Events
+import qualified Splice.TokenStandard.Utils.Internal.Allocations as U
+import qualified Splice.TokenStandard.Utils.Internal.Choices as U
+import qualified Splice.TokenStandard.Utils.Internal.Conversions as U
+import qualified Splice.TokenStandard.Utils.Internal.Events as U
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import qualified Cayvox.VaultV1.Internal.TokenStandard as C
+import Cayvox.VaultV1Test.Setup
+
+-- Harness
+----------
+
+-- | Runs one side of an `Update` function; its result is compared by the
+-- script.
+template DiffHarness
+  with
+    owner : Party
+  where
+    signatory owner
+
+    nonconsuming choice Diff_CheckActors : ()
+      with ours : Bool; actors : [Party]; allowed : [[Party]]
+      controller owner
+      do if ours then C.checkActors actors allowed else U.checkActors actors allowed
+
+    nonconsuming choice Diff_ValidateNextIteration : ()
+      with ours : Bool; allowed : Bool; extra : [TransferLegSide]; funding : Optional (TextMap.TextMap Decimal)
+      controller owner
+      do if ours then C.validateNextIterationArgs allowed extra funding
+         else U.validateNextIterationArgs "finalizedAllocation" allowed extra funding
+
+    nonconsuming choice Diff_EnsureWithdraw : ()
+      with ours : Bool; spec : AllocationSpecification
+      controller owner
+      do if ours then C.ensureWithdrawIsAllowed spec else U.ensureWithdrawIsAllowed spec
+
+    nonconsuming choice Diff_FetchAndValidate : [(FinalizedAllocation, AllocationView)]
+      with ours : Bool; admin : Party; batch : SettlementFactory_SettleBatch
+      controller owner
+      do if ours then C.fetchAndValidateAllocations admin (fmap view . fetch) batch
+         else U.fetchAndValidateAllocations admin batch
+
+    nonconsuming choice Diff_LogHoldingsChange : ()
+      with eventLog : ContractId Events.EventLog; change : Events.EventLog_HoldingsChange
+      controller owner
+      do U.logHoldingsChange eventLog change
+
+    nonconsuming choice Diff_LogAllocationSettlement : ()
+      with eventLog : ContractId Events.EventLog; inputs : [ContractId Holding]; spec : AllocationSpecification; outputs : [ContractId Holding]
+      controller owner
+      do U.logAllocationSettlement eventLog inputs spec outputs
+
+    nonconsuming choice Diff_PublicFetch : (SettlementFactoryView, SettlementFactoryView)
+      with rules : ContractId ShareRules
+      controller owner
+      do
+        r <- fetch rules
+        u <- U.publicFetchDefaultImpl @SettlementFactory r (toInterfaceContractId rules) ()
+        c <- C.publicFetch (view (toInterface @SettlementFactory r))
+        pure (u, c)
+
+-- | An event log that accepts every event, to observe which ones utils emits.
+template RecordingLog
+  with
+    owner : Party
+  where
+    signatory owner
+
+    interface instance Events.EventLog for RecordingLog where
+      view = Events.EventLogView with admin = owner; meta = emptyMetadata
+      eventLog_holdingsChangeImpl _ _ = pure Events.EventLog_HoldingsChangeResult
+
+-- | A settlement factory built on the utils default implementation, for the
+-- share registry's allocations.
+template UtilsSettlementFactory
+  with
+    admin : Party
+  where
+    signatory admin
+
+    interface instance SettlementFactory for UtilsSettlementFactory where
+      view = SettlementFactoryView with admin; meta = emptyMetadata
+      settlementFactory_settleBatchExtraObservers = U.settlementFactoryV2_privateAsset_settleBatchExtraObserversDefaultImpl
+      settlementFactory_publicFetchImpl self arg = U.publicFetchDefaultImpl this self arg
+      settlementFactory_settleBatchImpl self arg =
+        U.settlementFactoryV2_settleBatchDefaultImpl (\_ settleArg -> pure settleArg.extraArgs) admin self arg
+
+-- | Run both sides; each is a success or a failure.
+bothSides : Party -> ContractId DiffHarness -> (Bool -> Commands a) -> Script (Bool, Bool)
+bothSides p h cmd = do
+  u <- trySubmit p (cmd False)
+  c <- trySubmit p (cmd True)
+  pure (either (const False) (const True) u, either (const False) (const True) c)
+
+harness : Text -> Script (Party, ContractId DiffHarness)
+harness tag = do
+  p <- allocateParty ("diff-" <> tag)
+  h <- submit p $ createCmd DiffHarness with owner = p
+  pure (p, h)
+
+-- Pure functions (1 to 10)
+---------------------------
+
+-- | `accountPrincipal`, `accountParties`, `basicAccount`, `mintAccount`,
+-- `burnAccount`: the same values for regular accounts with and without a
+-- provider, a provider equal to the owner, and special accounts.
+test_diff_accounts : Script ()
+test_diff_accounts = do
+  admin <- allocateParty "diff-admin"
+  alice <- allocateParty "diff-alice"
+  prov <- allocateParty "diff-prov"
+  let accounts =
+        [ Account (Some alice) None "", Account (Some alice) (Some prov) "", Account (Some alice) (Some alice) "x"
+        , Account None None "cip-112/mint", Account None (Some prov) "", U.mintAccount, U.burnAccount ]
+  forA_ accounts $ \a -> do
+    C.accountPrincipal admin a === U.accountPrincipal admin a
+    C.accountParties admin a === U.accountParties admin a
+  C.basicAccount alice === U.basicAccount alice
+  C.mintAccount === U.mintAccount
+  C.burnAccount === U.burnAccount
+
+-- | `senderSide`, `receiverSide`, `transferLegSidesWithAuthorizer`,
+-- `nonIteratedAllocation` and `netAllocationCreditAmounts`.
+test_diff_legs : Script ()
+test_diff_legs = do
+  admin <- allocateParty "diff-legs-admin"
+  alice <- allocateParty "diff-legs-alice"
+  bob <- allocateParty "diff-legs-bob"
+  (_, h) <- harness "legs"
+  let a = C.basicAccount alice
+      b = C.basicAccount bob
+      legs =
+        [ TransferLeg "l1" a b 1.0 "X" emptyMetadata, TransferLeg "l2" b a 2.5 "X" emptyMetadata
+        , TransferLeg "l3" C.mintAccount a 3.0 "X" emptyMetadata, TransferLeg "l4" a C.burnAccount 4.0 "Y" emptyMetadata
+        , TransferLeg "l5" a a 5.0 "Y" (Metadata (TextMap.fromList [("k", "v")])) ]
+  forA_ legs $ \l -> do
+    C.senderSide l === U.senderSide l
+    C.receiverSide l === U.receiverSide l
+    C.transferLegSidesWithAuthorizer l === U.transferLegSidesWithAuthorizer l
+  let allocationCid = coerceContractId h : ContractId Allocation
+  C.nonIteratedAllocation allocationCid === U.nonIteratedAllocation allocationCid
+  let sides = concatMap (\l -> [C.senderSide l, C.receiverSide l]) legs
+  forA_ [a, b, C.mintAccount, C.burnAccount] $ \authorizer -> do
+    forA_ [sides, take 3 sides, [], filter (\s -> s.side == SenderSide) sides] $ \ss ->
+      TextMap.toList (C.netAllocationCreditAmounts authorizer ss) === TextMap.toList (U.netAllocationCreditAmounts authorizer ss)
+  let _ = admin
+  pure ()
+
+-- | `settlementFactoryV2_privateAsset_settleBatchExtraObserversDefaultImpl`.
+test_diff_settleBatchExtraObservers : Script ()
+test_diff_settleBatchExtraObservers = do
+  reg <- setupRegistry "diff-obs"
+  let arg = SettlementFactory_SettleBatch with
+        settlement = settlementOf reg "s"; transferLegs = []; allocations = []; actors = [reg.operator]; extraArgs = noArgs
+  C.settleBatchExtraObservers arg === U.settlementFactoryV2_privateAsset_settleBatchExtraObserversDefaultImpl arg
+
+-- Update functions (11 to 20)
+------------------------------
+
+-- | `publicFetchDefaultImpl`: the same view.
+test_diff_publicFetch : Script ()
+test_diff_publicFetch = do
+  reg <- setupRegistry "diff-fetch"
+  h <- submit reg.operator $ createCmd DiffHarness with owner = reg.operator
+  (u, c) <- submit reg.operator $ exerciseCmd h Diff_PublicFetch with rules = reg.rules
+  u === c
+
+-- | `checkActors`: the same decision for every case.
+test_diff_checkActors : Script ()
+test_diff_checkActors = do
+  (p, h) <- harness "actors"
+  a <- allocateParty "diff-actors-a"
+  b <- allocateParty "diff-actors-b"
+  let cases =
+        [ ([a], [[a]]), ([a], [[b]]), ([a, b], [[a, b]]), ([b, a], [[a, b]]), ([a, a], [[a]]), ([a], [[a, b]])
+        , ([a], [[b], [a]]), ([], [[]]), ([], [[a]]), ([a], []), ([a, b], [[a], [b]]) ]
+  forA_ cases $ \(actors, allowed) -> do
+    (u, c) <- bothSides p h (\ours -> exerciseCmd h Diff_CheckActors with ours; actors; allowed)
+    check ("checkActors differs on " <> show (actors, allowed)) (u == c)
+  -- anchors: one accepted and one rejected case on both sides
+  bothSides p h (\ours -> exerciseCmd h Diff_CheckActors with ours; actors = [a]; allowed = [[a]]) >>= (=== (True, True))
+  bothSides p h (\ours -> exerciseCmd h Diff_CheckActors with ours; actors = [a]; allowed = [[b]]) >>= (=== (False, False))
+
+-- | `validateNextIterationArgs`: the same decision for every case.
+test_diff_validateNextIterationArgs : Script ()
+test_diff_validateNextIterationArgs = do
+  (p, h) <- harness "iteration"
+  alice <- allocateParty "diff-iteration-alice"
+  let side amount = TransferLegSide "l" SenderSide (C.basicAccount alice) amount "X" emptyMetadata
+      cases =
+        [ (False, [], None), (False, [side 1.0], None), (False, [], Some TextMap.empty)
+        , (True, [], None), (True, [side 1.0], Some (TextMap.fromList [("X", 1.0)]))
+        , (True, [side 0.0], None), (True, [], Some (TextMap.fromList [("X", 0.0)]))
+        , (True, [side (-1.0)], Some (TextMap.fromList [("X", -1.0)])) ]
+  outcomes <- forA cases $ \(allowed, extra, funding) -> do
+    (u, c) <- bothSides p h (\ours -> exerciseCmd h Diff_ValidateNextIteration with ours; allowed; extra; funding)
+    check ("validateNextIterationArgs differs on " <> show (allowed, extra, funding)) (u == c)
+    pure u
+  check "the cases do not include both outcomes" (True `elem` outcomes && False `elem` outcomes)
+
+-- | `ensureWithdrawIsAllowed`: the same decision before, at and after the
+-- deadline, committed or not, with and without a deadline.
+test_diff_ensureWithdrawIsAllowed : Script ()
+test_diff_ensureWithdrawIsAllowed = do
+  (p, h) <- harness "withdraw"
+  alice <- allocateParty "diff-withdraw-alice"
+  now <- getTime
+  let deadline = addRelTime now (seconds 10)
+      spec committed d = AllocationSpecification with
+        admin = p; authorizer = C.basicAccount alice; transferLegSides = []; settlementDeadline = d
+        nextIterationFunding = None; committed; meta = emptyMetadata
+      compareAt = forA [(False, None), (False, Some deadline), (True, None), (True, Some deadline)] $ \(committed, d) -> do
+        (u, c) <- bothSides p h (\ours -> exerciseCmd h Diff_EnsureWithdraw with ours; spec = spec committed d)
+        check ("ensureWithdrawIsAllowed differs on " <> show (committed, d)) (u == c)
+        pure u
+  compareAt >>= (=== [True, True, False, False])
+  setTime deadline
+  compareAt >>= (=== [True, True, False, False])
+  setTime (addRelTime deadline (microseconds 1))
+  compareAt >>= (=== [True, True, False, True])
+
+-- | `fetchAndValidateAllocations` on the registry's allocations: the same
+-- decision and the same validated views, except for the two documented
+-- differences (no transfer leg; the finalized allocation's own
+-- `nextIterationFunding`).
+test_diff_fetchAndValidateAllocations : Script ()
+test_diff_fetchAndValidateAllocations = do
+  reg <- setupRegistry "diff-validate"
+  alice <- allocateParty "diff-validate-alice"
+  bob <- allocateParty "diff-validate-bob"
+  hAlice <- mintShares reg alice 10.0 "diff-validate"
+  h <- submit reg.operator $ createCmd DiffHarness with owner = reg.operator
+  let s = settlementOf reg "s"
+      leg = shareLeg reg "l" (C.basicAccount alice) (C.basicAccount bob) 4.0
+  (send, _) <- allocate reg [alice] s (specOf reg (C.basicAccount alice) [C.senderSide leg] None False) [hAlice]
+  (recv, _) <- allocate reg [bob] s (specOf reg (C.basicAccount bob) [C.receiverSide leg] None False) []
+  let arg legs allocations settlement = SettlementFactory_SettleBatch with
+        settlement; transferLegs = legs; allocations; actors = [reg.operator]; extraArgs = noArgs
+      finals = map C.nonIteratedAllocation [send, recv]
+      runAs admin a = do
+        u <- trySubmit reg.operator (exerciseCmd h Diff_FetchAndValidate with ours = False; admin; batch = a)
+        c <- trySubmit reg.operator (exerciseCmd h Diff_FetchAndValidate with ours = True; admin; batch = a)
+        pure (u, c)
+      run = runAs reg.operator
+      sameAs admin label a = do
+        (u, c) <- runAs admin a
+        case (u, c) of
+          (Right x, Right y) -> x === y
+          (Left _, Left _) -> pure ()
+          _ -> abort ("fetchAndValidateAllocations differs: " <> label)
+      same = sameAs reg.operator
+  -- anchor: the valid batch is accepted by both, with the same views
+  (uv, cv) <- run (arg [leg] finals s)
+  check "the valid batch is rejected" (isRight uv && isRight cv)
+  same "valid" (arg [leg] finals s)
+  same "another settlement" (arg [leg] finals (s with id = "other"))
+  same "missing authorization" (arg [leg] (take 1 finals) s)
+  same "duplicate leg identifiers" (arg [leg, leg] finals s)
+  same "non-positive amount" (arg [leg with amount = 0.0] finals s)
+  same "extra leg sides" (arg [leg] (map (\f -> f with extraTransferLegSides = [C.receiverSide leg]) finals) s)
+  same "superfluous authorization" (arg [] finals s)
+  sameAs bob "another admin" (arg [leg] finals s)
+  (ua, _) <- runAs bob (arg [leg] finals s)
+  check "utils accepts another admin" (not (isRight ua))
+  -- documented difference: no transfer leg and no allocation
+  (u1, c1) <- run (arg [] [] s)
+  check "utils accepts an empty settlement" (isRight u1)
+  assertFails (registry "no-transfer-legs") c1
+  -- documented difference: next-iteration funding on the finalized allocation
+  (u2, c2) <- run (arg [leg] (map (\f -> f with nextIterationFunding = Some TextMap.empty) finals) s)
+  check "utils accepts the finalized funding" (isRight u2)
+  assertFails (registry "iterated-settlement") c2
+
+-- | `settlementFactoryV2_settleBatchDefaultImpl`: the same settlement run
+-- through the registry's factory and through a factory built on the utils
+-- default gives the same balances and the same results' shape.
+test_diff_settleBatch : Script ()
+test_diff_settleBatch = do
+  reg <- setupRegistry "diff-settle"
+  alice <- allocateParty "diff-settle-alice"
+  bob <- allocateParty "diff-settle-bob"
+  utilsFactory <- submit reg.operator $ createCmd UtilsSettlementFactory with admin = reg.operator
+  h1 <- mintShares reg alice 10.0 "diff-settle-1"
+  h2 <- mintShares reg alice 10.0 "diff-settle-2"
+  let pair id h = do
+        let s = settlementOf reg id
+            leg = shareLeg reg "l" (C.basicAccount alice) (C.basicAccount bob) 4.0
+        (send, _) <- allocate reg [alice] s (specOf reg (C.basicAccount alice) [C.senderSide leg] None False) [h]
+        (recv, _) <- allocate reg [bob] s (specOf reg (C.basicAccount bob) [C.receiverSide leg] None False) []
+        pure (s, leg, [send, recv])
+  (s1, l1, a1) <- pair "ours" h1
+  (s2, l2, a2) <- pair "utils" h2
+  ours <- settle reg s1 [l1] a1
+  utils <- submit reg.operator $ exerciseCmd (toInterfaceContractId @SettlementFactory utilsFactory) SettlementFactory_SettleBatch with
+    settlement = s2; transferLegs = [l2]; allocations = map C.nonIteratedAllocation a2; actors = [reg.operator]; extraArgs = noArgs
+  map (\r -> (r.output, map fst (TextMap.toList r.authorizerHoldingCids), map (length . snd) (TextMap.toList r.authorizerHoldingCids))) ours.allocationSettleResults
+    === map (\r -> (r.output, map fst (TextMap.toList r.authorizerHoldingCids), map (length . snd) (TextMap.toList r.authorizerHoldingCids))) utils.allocationSettleResults
+  balanceOf reg alice >>= (=== (12.0, 0.0))
+  balanceOf reg bob >>= (=== (8.0, 0.0))
+  -- the same actor rule: a non-executor fails on both factories
+  d <- rulesDisclosure reg
+  u <- trySubmit alice $ exerciseCmd (toInterfaceContractId @SettlementFactory utilsFactory) SettlementFactory_SettleBatch with
+    settlement = s2; transferLegs = [l2]; allocations = []; actors = [alice]; extraArgs = noArgs
+  c <- trySubmit (actAs alice <> disclose d) $ exerciseCmd (toInterfaceContractId @SettlementFactory reg.rules) SettlementFactory_SettleBatch with
+    settlement = s2; transferLegs = [l2]; allocations = []; actors = [alice]; extraArgs = noArgs
+  check "the actor rule differs" (isRight u == isRight c)
+
+-- | `logHoldingsChange`: utils emits an event exactly when the registry's
+-- `holdingsChangeIsLogged` holds.
+test_diff_logHoldingsChange : Script ()
+test_diff_logHoldingsChange = do
+  (p, h) <- harness "log"
+  alice <- allocateParty "diff-log-alice"
+  logCid <- submit p $ createCmd RecordingLog with owner = p
+  holdingCid <- mintShareCid p alice
+  let leg = Events.TransferLegSide "l" Events.SenderSide (C.basicAccount alice) 1.0 "X" emptyMetadata
+      arg account legs inputs outputs = Events.EventLog_HoldingsChange with
+        admin = p; account; inputHoldingCids = inputs; transferLegSides = legs; outputHoldingCids = outputs
+        observers = [p]; extraArgs = noArgs
+      cases =
+        [ arg (C.basicAccount alice) [] [] [], arg (C.basicAccount alice) [leg] [] [], arg (C.basicAccount alice) [] [holdingCid] []
+        , arg (C.basicAccount alice) [] [] [holdingCid], arg C.mintAccount [leg] [holdingCid] [], arg C.burnAccount [] [] [] ]
+  emitted <- forA cases $ \a -> do
+    tree <- submitTree p $ exerciseCmd h Diff_LogHoldingsChange with eventLog = toInterfaceContractId logCid; change = a
+    let e = not (null (eventsIn tree))
+    check ("logHoldingsChange differs on " <> show a.account) (e == C.holdingsChangeIsLogged a)
+    pure e
+  check "the cases do not include both outcomes" (True `elem` emitted && False `elem` emitted)
+
+-- | `logAllocationSettlement`: utils emits the same event the registry builds.
+test_diff_logAllocationSettlement : Script ()
+test_diff_logAllocationSettlement = do
+  (p, h) <- harness "log-settle"
+  alice <- allocateParty "diff-log-settle-alice"
+  prov <- allocateParty "diff-log-settle-prov"
+  logCid <- submit p $ createCmd RecordingLog with owner = p
+  holdingCid <- mintShareCid p alice
+  let acct = Account with owner = Some alice; provider = Some prov; id = ""
+      side = TransferLegSide "l" ReceiverSide C.mintAccount 1.0 "X" emptyMetadata
+      spec = AllocationSpecification with
+        admin = p; authorizer = acct; transferLegSides = [side]; settlementDeadline = None
+        nextIterationFunding = None; committed = False; meta = emptyMetadata
+  tree <- submitTree p $ exerciseCmd h Diff_LogAllocationSettlement with
+    eventLog = toInterfaceContractId logCid; inputs = []; spec; outputs = [holdingCid]
+  eventsIn tree === [C.allocationSettlementEvent [] spec [holdingCid]]
+
+-- | `allocationV2_cancelDefaultImpl` and `allocationV2_withdrawDefaultImplUsingV1`:
+-- the registry's cancel allows the executors, as utils does for an
+-- allocation that never expires (`expiresAt = None`), and rejects the admin
+-- and the authorizer. Utils' withdraw exists only through the V1 interface,
+-- which the registry does not implement (D-07); the registry's withdraw is
+-- tested against the V2 rules instead (`Cayvox.VaultV1Test.Allocations`).
+test_diff_cancelAllocation : Script ()
+test_diff_cancelAllocation = do
+  reg <- setupRegistry "diff-cancel"
+  alice <- allocateParty "diff-cancel-alice"
+  bob <- allocateParty "diff-cancel-bob"
+  executor <- allocateParty "diff-cancel-executor"
+  hAlice <- mintShares reg alice 10.0 "diff-cancel"
+  let s = SettlementInfo with executors = [executor]; id = "s"; cid = None; meta = emptyMetadata
+      leg = shareLeg reg "l" (C.basicAccount alice) (C.basicAccount bob) 4.0
+  (send, _) <- allocate reg [alice] s (specOf reg (C.basicAccount alice) [C.senderSide leg] None False) [hAlice]
+  let cancelBy actors = trySubmit (actAs actors) $ exerciseCmd send Allocation_Cancel with actors; extraArgs = noArgs
+  cancelBy [reg.operator] >>= assertFails (registry "unauthorized-actors")
+  cancelBy [alice] >>= assertFails (registry "unauthorized-actors")
+  res <- cancelBy [executor]
+  case res of
+    Right r -> r.output === AllocationResult_Cancelled
+    Left e -> abort (show e)
+
+-- Helpers
+----------
+
+-- | The events a tree reports.
+eventsIn : TransactionTree -> [Events.EventLog_HoldingsChange]
+eventsIn tree = (treeFacts tree).events
+
+-- | A holding contract ID to name in events; any contract serves.
+mintShareCid : Party -> Party -> Script (ContractId Holding)
+mintShareCid p _ = do
+  logCid <- submit p $ createCmd RecordingLog with owner = p
+  pure (coerceContractId logCid)
+
+isRight : Either a b -> Bool
+isRight = either (const False) (const True)

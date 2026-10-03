@@ -1,0 +1,24 @@
+sdk-version: 3.4.11
+name: cvx-vault-reconcile-tool-test
+source: daml
+version: 0.0.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../../packages/utils/vault-math-v1/.daml/dist/cvx-vault-math-v1-0.1.0.dar
+  - ../../packages/token/api-vault-v1/.daml/dist/cvx-api-vault-v1-0.1.0.dar
+  - ../../packages/token/vault-v1/.daml/dist/cvx-vault-v1-0.1.0.dar
+  - ../../dars/vendor/splice-api-token-metadata-v1-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-holding-v2-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-allocation-v2-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-allocation-instruction-v2-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-transfer-instruction-v2-1.0.0.dar
+  - ../../dars/vendor/splice-api-token-transfer-events-v2-1.0.0.dar
+  - ../../dars/vendor/splice-token-standard-utils-2.0.0.dar
+  - ../../dars/vendor/splice-test-token-v2-1.0.1.dar
+  - ../../test/vault-v1-test/.daml/dist/cvx-vault-v1-test-0.0.0.dar
+  - ../vault-reconcile/.daml/dist/cvx-vault-reconcile-tool-0.0.0.dar
+build-options:
+  - --target=2.1

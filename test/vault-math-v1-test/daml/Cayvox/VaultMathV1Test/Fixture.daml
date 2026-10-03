@@ -1,0 +1,24 @@
+-- | A fixture that calls `mulDiv` inside a choice, so that its failures
+-- reach the test as a failed submission (`docs/TESTING.md`, section 3).
+module Cayvox.VaultMathV1Test.Fixture
+  ( MathHarness (..)
+  , MathHarness_MulDiv (..)
+  ) where
+
+import Cayvox.VaultMathV1
+
+-- | Holds nothing; its only choice evaluates `mulDiv`.
+template MathHarness
+  with
+    owner : Party
+  where
+    signatory owner
+
+    nonconsuming choice MathHarness_MulDiv : Decimal
+      with
+        rounding : Rounding
+        a : Decimal
+        b : Decimal
+        c : Decimal
+      controller owner
+      do pure (mulDiv rounding a b c)

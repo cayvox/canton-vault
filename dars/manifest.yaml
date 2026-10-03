@@ -1,0 +1,448 @@
+# Cayvox vault DAR manifest.
+#
+# Records the identity and provenance of the third-party DARs vendored under
+# dars/vendor/. It is not DPM's daml.lock and does not install, upload or vet
+# packages. The layout follows canton-contracts dars/manifest.yaml at
+# aeca01d043311d8ccc8ab7cda4d7c16e682429fa (lines 1-28), with the upstream tag,
+# commit, path, SDK and LF version, and use added per entry.
+#
+# Each entry contains:
+# - kind: `vendor` for a third-party DAR
+# - package: Daml package name
+# - version: Daml package version
+# - file: repository-relative path to the DAR
+# - main-package-id: package ID of the DAR's main package
+# - package-ids: complete package-ID closure represented by the DAR
+# - sha256: lowercase SHA-256 digest of the DAR file
+# - source: canonical upstream artifact URL
+# - upstream-repository, upstream-tag, upstream-commit, upstream-path: where the
+#   file is in the upstream repository; the file is byte-identical to it
+# - sdk-version: `Sdk-Version` in the DAR's META-INF/MANIFEST.MF
+# - lf-version: Daml-LF version of the main package (`dpm damlc inspect`)
+# - license: SPDX license identifier; the text is in LICENSES/
+# - use: `production` for a dependency of a production package, `test` for a
+#   dependency of test packages only
+#
+# The reasons for each entry are in ARCHITECTURE.md, section 3.
+# scripts/check-token-dars.sh verifies every entry (gate Q-16).
+
+schema-version: 1
+
+artifacts:
+  - kind: vendor
+    package: splice-api-token-metadata-v1
+    version: 1.0.0
+    file: dars/vendor/splice-api-token-metadata-v1-1.0.0.dar
+    main-package-id: 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+    package-ids:
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: 455eb160cb5abd4ae9918a6fbb9dad471f721adda39f0e5c76feef08d05637fc
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-api-token-metadata-v1-1.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-api-token-metadata-v1-1.0.0.dar
+    sdk-version: 3.3.0-snapshot.20250502.13767.0.v2fc6c7e2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: production
+  - kind: vendor
+    package: splice-api-token-holding-v2
+    version: 1.0.0
+    file: dars/vendor/splice-api-token-holding-v2-1.0.0.dar
+    main-package-id: 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+    package-ids:
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: f044b34d7a28c2b6c8a540af720297d55450a889b451dc4eed64a9914f1d6b00
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-api-token-holding-v2-1.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-api-token-holding-v2-1.0.0.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: production
+  - kind: vendor
+    package: splice-api-token-allocation-v2
+    version: 1.0.0
+    file: dars/vendor/splice-api-token-allocation-v2-1.0.0.dar
+    main-package-id: 051a3b0563a6fa4df4cb34448081e48b061e555aa1a265abf6ae8f3f4cafe439
+    package-ids:
+      - 051a3b0563a6fa4df4cb34448081e48b061e555aa1a265abf6ae8f3f4cafe439
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: e349d3a1952cdd52ed55333bef35e9ba40e6e0379521d65556c6aa2f50d9a1fd
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-api-token-allocation-v2-1.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-api-token-allocation-v2-1.0.0.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: production
+  - kind: vendor
+    package: splice-api-token-allocation-instruction-v2
+    version: 1.0.0
+    file: dars/vendor/splice-api-token-allocation-instruction-v2-1.0.0.dar
+    main-package-id: 9818a0b5b827109de03a04c8f6151cde9d1e7fe5123dbb2dfeb0e52d7271287c
+    package-ids:
+      - 9818a0b5b827109de03a04c8f6151cde9d1e7fe5123dbb2dfeb0e52d7271287c
+      - 051a3b0563a6fa4df4cb34448081e48b061e555aa1a265abf6ae8f3f4cafe439
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: 31de6be30385936105b24c8ea544bb25f6eede0d0c008154a11462bb6d14a17b
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-api-token-allocation-instruction-v2-1.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-api-token-allocation-instruction-v2-1.0.0.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: production
+  - kind: vendor
+    package: splice-api-token-transfer-instruction-v2
+    version: 1.0.0
+    file: dars/vendor/splice-api-token-transfer-instruction-v2-1.0.0.dar
+    main-package-id: 29317e3b7b165d2bbf16721bcca0ec4869e53eddb2738bddf790d61af28e0099
+    package-ids:
+      - 29317e3b7b165d2bbf16721bcca0ec4869e53eddb2738bddf790d61af28e0099
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: 720e766456b33abdd26bfc21e54d19413559f0a7ee52000e12d3b6c308199faa
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-api-token-transfer-instruction-v2-1.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-api-token-transfer-instruction-v2-1.0.0.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: production
+  - kind: vendor
+    package: splice-api-token-transfer-events-v2
+    version: 1.0.0
+    file: dars/vendor/splice-api-token-transfer-events-v2-1.0.0.dar
+    main-package-id: 5c1097a9bad0af4bcfe6d3fb0fe55112d3d11f18eae57ddfb14c20836fee226c
+    package-ids:
+      - 5c1097a9bad0af4bcfe6d3fb0fe55112d3d11f18eae57ddfb14c20836fee226c
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: 9a1ebe5aece0a7f1a49069fd7aba0ced92c4ae94e5e3d49cdb097733a87dddbc
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-api-token-transfer-events-v2-1.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-api-token-transfer-events-v2-1.0.0.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: production
+  - kind: vendor
+    package: splice-token-standard-utils
+    version: 2.0.0
+    file: dars/vendor/splice-token-standard-utils-2.0.0.dar
+    main-package-id: 9a8f41a2b1456d357dee5677565c21b9a5aa45b80f0ed6be469694445dd4f6e1
+    package-ids:
+      - 9a8f41a2b1456d357dee5677565c21b9a5aa45b80f0ed6be469694445dd4f6e1
+      - 051a3b0563a6fa4df4cb34448081e48b061e555aa1a265abf6ae8f3f4cafe439
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 275064aacfe99cea72ee0c80563936129563776f67415ef9f13e4297eecbc520
+      - 29317e3b7b165d2bbf16721bcca0ec4869e53eddb2738bddf790d61af28e0099
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 5c1097a9bad0af4bcfe6d3fb0fe55112d3d11f18eae57ddfb14c20836fee226c
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 6fe848530b2404017c4a12874c956ad7d5c8a419ee9b040f96b5c13172d2e193
+      - 718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 93c942ae2b4c2ba674fb152fe38473c507bda4e82b4e4c5da55a552a9d8cce1d
+      - 9818a0b5b827109de03a04c8f6151cde9d1e7fe5123dbb2dfeb0e52d7271287c
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - adc16315a8943a8433886694720a2a000ae84c2315c4414bd6d0db4d1660de9c
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: 3346dedf1c4617e92858fe93d6f9c81ebb1a92a6d809378f487e516aa8f877fc
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-token-standard-utils-2.0.0.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-token-standard-utils-2.0.0.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: test
+  - kind: vendor
+    package: splice-test-token-v2
+    version: 1.0.1
+    file: dars/vendor/splice-test-token-v2-1.0.1.dar
+    main-package-id: 6f2bddc934eb700ee00afa209eb1d49f861af6401037618f6aa7e6ac02c8e201
+    package-ids:
+      - 6f2bddc934eb700ee00afa209eb1d49f861af6401037618f6aa7e6ac02c8e201
+      - 051a3b0563a6fa4df4cb34448081e48b061e555aa1a265abf6ae8f3f4cafe439
+      - 0e4a572ab1fb94744abb02243a6bbed6c78fc6e3c8d3f60c655f057692a62816
+      - 19f0df5fdaf5a96e137b6ea885fdb378f37bd3166bd9a47ee11518e33fa09a20
+      - 22ffcbab726e64e179deebd895307fad94efbae3f72b07677e24038d0fbf4467
+      - 275064aacfe99cea72ee0c80563936129563776f67415ef9f13e4297eecbc520
+      - 29317e3b7b165d2bbf16721bcca0ec4869e53eddb2738bddf790d61af28e0099
+      - 3cde94fe9be5c700fc1d9a8ad2277e2c1214609f8c52a5b4db77e466875b8cb7
+      - 4039f60273388c5701e27950ab3e8c3044433b0876535a3b48fb042cc77bf02a
+      - 4b7ecfc366d79ccc5ed07c80f26fe489cf2dfd43ce2856c06a78e6a048db7032
+      - 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+      - 52854220dc199884704958df38befd5492d78384a032fd7558c38f00e3d778a2
+      - 54f85ebfc7dfae18f7d70370015dcc6c6792f60135ab369c44ae52c6fc17c274
+      - 55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281
+      - 5aee9b21b8e9a4c4975b5f4c4198e6e6e8469df49e2010820e792f393db870f4
+      - 5c1097a9bad0af4bcfe6d3fb0fe55112d3d11f18eae57ddfb14c20836fee226c
+      - 60c61c542207080e97e378ab447cc355ecc47534b3a3ebbff307c4fb8339bc4d
+      - 6da1f43a10a179524e840e7288b47bda213339b0552d92e87ae811e52f59fc0e
+      - 6f8e6085f5769861ae7a40dccd618d6f747297d59b37cab89b93e2fa80b0c024
+      - 6fe848530b2404017c4a12874c956ad7d5c8a419ee9b040f96b5c13172d2e193
+      - 718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b
+      - 7adc4c2d07fa3a51173c843cba36e610c1168b2dbbf53076e20c0092eae8763d
+      - 86d888f34152dae8729900966b44abcb466b9c111699678de58032de601d2b04
+      - 91e167fa7a256f21f990c526a0a0df840e99aeef0e67dc1f5415b0309486de74
+      - 93c942ae2b4c2ba674fb152fe38473c507bda4e82b4e4c5da55a552a9d8cce1d
+      - 9818a0b5b827109de03a04c8f6151cde9d1e7fe5123dbb2dfeb0e52d7271287c
+      - 9a8f41a2b1456d357dee5677565c21b9a5aa45b80f0ed6be469694445dd4f6e1
+      - 9d1a644e686435cf934f2f3f049138a424863b2a800130046dadc0c994ea5df3
+      - 9e70a8b3510d617f8a136213f33d6a903a10ca0eeec76bb06ba55d1ed9680f69
+      - a1fa18133ae48cbb616c4c148e78e661666778c3087d099067c7fe1868cbb3a1
+      - ab068e2f920d0e06347975c2a342b71f8b8e3b4be0f02ead9442caac51aa8877
+      - adc16315a8943a8433886694720a2a000ae84c2315c4414bd6d0db4d1660de9c
+      - b70db8369e1c461d5c70f1c86f526a29e9776c655e6ffc2560f95b05ccb8b946
+      - bde4bd30749e99603e5afa354706608601029e225d4983324d617825b634253a
+      - bfda48f9aa2c89c895cde538ec4b4946c7085959e031ad61bde616b9849155d7
+      - c280cc3ef501d237efa7b1120ca3ad2d196e089ad596b666bed59a85f3c9a074
+      - c3bb0c5d04799b3f11bad7c3c102963e115cf53da3e4afcbcfd9f06ebd82b4ff
+      - cae345b5500ef6f84645c816f88b9f7a85a9f3c71697984abdf6849f81e80324
+      - d095a2ccf6dd36b2415adc4fa676f9191ba63cd39828dc5207b36892ec350cbc
+      - e5411f3d75f072b944bd88e652112a14a3d409c491fd9a51f5f6eede6d3a3348
+      - e7e0adfa881e7dbbb07da065ae54444da7c4bccebcb8872ab0cb5dcf9f3761ce
+      - ee33fb70918e7aaa3d3fc44d64a399fb2bf5bcefc54201b1690ecd448551ba88
+      - f181cd661f7af3a60bdaae4b0285a2a67beb55d6910fc8431dbae21a5825ec0f
+      - fa79192fe1cce03d7d8db36471dde4cf6c96e6d0f07e1c391dd49e355af9b38c
+      - fcee8dfc1b81c449b421410edd5041c16ab59c45bbea85bcb094d1b17c3e9df7
+    sha256: 1d6f5a296a6fedd18ff71dd29bfbf15b9f971303611d1ab49e5c08442fc37a57
+    source: https://github.com/canton-network/splice/raw/0.8.4/daml/dars/splice-test-token-v2-1.0.1.dar
+    upstream-repository: https://github.com/canton-network/splice
+    upstream-tag: 0.8.4
+    upstream-commit: fa6b029f2563423f3f612302cfdc84986366479d
+    upstream-path: daml/dars/splice-test-token-v2-1.0.1.dar
+    sdk-version: 3.5.2
+    lf-version: "2.1"
+    license: Apache-2.0
+    use: test

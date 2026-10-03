@@ -1,0 +1,426 @@
+-- | The order of the vault's checks (`docs/SPEC.md` §5.3 to §5.5): where a
+-- batch or a request fails two checks, the earlier one's identifier is
+-- reported. Also the phase order of §5.3, the running state of a batch,
+-- and the executor rule for batches of several requesters.
+module Cayvox.VaultV1Test.VaultOrder where
+
+import DA.Assert ((===))
+import DA.Fail (FailureCategory (..))
+import DA.List (head, last, sortOn)
+import DA.Optional (fromSome, isSome)
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import qualified Splice.Api.Token.AllocationV2 as V2A
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+
+import Cayvox.Api.VaultV1 (Vault)
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Conversion
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+vaultErr : Text -> Expected
+vaultErr name = Status ("cayvox.com/vault-" <> name) InvalidGivenCurrentSystemStateOther
+
+u : Decimal
+u = 0.0000000001
+
+-- | A deposit request with every field given, unfunded or flagged funded.
+rawDeposit : World -> Party -> Text -> Decimal -> Decimal -> Bool -> Time -> Script (ContractId DepositRequest)
+rawDeposit w p vaultId amount minOut funded deadline = submit p $ createCmd DepositRequest with
+  requester = p; operator = w.operator; vaultId; payAccount = basicAccount p; receiver = basicAccount p
+  amount; minOut; deadline; funded; meta = emptyMetadata
+
+-- | `Vault_ExecuteDeposits` by the operator, without disclosures: for
+-- batches that fail before any allocation.
+executeRaw : World -> [DepositItem] -> Script (Either SubmitError ExecResult)
+executeRaw w items = do
+  (cid, _) <- vaultOf w
+  trySubmit (actAs w.operator) $ exerciseCmd cid Vault_ExecuteDeposits with
+    executor = w.operator; items; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+
+unfunded : ContractId DepositRequest -> DepositItem
+unfunded request = DepositItem with request; fundingAllocation = None; fundingInputs = []
+
+-- Batch checks (steps 1 to 4)
+------------------------------
+
+-- | Step 1 before step 2: in Permissionless mode, a paused vault refuses
+-- another requester's request as unauthorized.
+test_order_executorBeforePaused : Script ()
+test_order_executorBeforePaused = do
+  w <- setupWorld "o-exec" Permissionless 0 2
+  let [alice, bob] = w.requesters
+  d <- newDeposit w alice 10.0 0.0 False
+  i <- depositItem w alice d
+  _ <- run =<< pause w
+  rd <- fromSome <$> queryDisclosure alice (fst d)
+  s <- executeDeposits w bob [(alice, i)]
+  attempt (s with disclosures = rd :: s.disclosures) >>= assertFails (vaultErr "unauthorized-executor")
+
+-- | Step 2 before step 3: a paused vault refuses an empty batch as paused.
+test_order_pausedBeforeBatchSize : Script ()
+test_order_pausedBeforeBatchSize = do
+  w <- setupWorld "o-paused" Permissioned 0 1
+  _ <- run =<< pause w
+  executeRaw w [] >>= assertFails (vaultErr "paused")
+
+-- | Step 3 before step 4: 26 items with one request twice.
+test_order_batchSizeBeforeDuplicate : Script ()
+test_order_batchSizeBeforeDuplicate = do
+  w <- setupWorld "o-size" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  reqs <- forA [1 .. 25] $ \_ -> rawDeposit w alice w.vaultId 1.0 0.0 False (addRelTime now (days 1))
+  executeRaw w (map unfunded (head reqs :: reqs)) >>= assertFails (vaultErr "batch-size")
+
+-- | Step 4 before step 5: a request of another vault, listed twice.
+test_order_duplicateBeforeWrongVault : Script ()
+test_order_duplicateBeforeWrongVault = do
+  w <- setupWorld "o-dup" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  r <- rawDeposit w alice "other" 1.0 0.0 False (addRelTime now (days 1))
+  executeRaw w [unfunded r, unfunded r] >>= assertFails (vaultErr "duplicate-request")
+
+-- Request checks (steps 5 to 12)
+---------------------------------
+
+-- | Step 5 before step 6: a request of another vault, at its deadline.
+test_order_wrongVaultBeforeExpired : Script ()
+test_order_wrongVaultBeforeExpired = do
+  w <- setupWorld "o-wrong" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  r <- rawDeposit w alice "other" 1.0 0.0 False now
+  executeRaw w [unfunded r] >>= assertFails (vaultErr "wrong-vault")
+
+-- | Step 6 before step 7: a request flagged funded, without its allocation,
+-- at its deadline.
+test_order_expiredBeforeFunding : Script ()
+test_order_expiredBeforeFunding = do
+  w <- setupWorld "o-expired" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  r <- rawDeposit w alice w.vaultId 1.0 0.0 True now
+  executeRaw w [unfunded r] >>= assertFails (vaultErr "request-expired")
+
+-- | Step 6 at the deadline, with a `minOut` the output cannot meet: the
+-- vault's deadline check fires, not the delegation's or the slippage check.
+test_order_expiredBeforeSlippage : Script ()
+test_order_expiredBeforeSlippage = do
+  w <- setupWorld "o-expired-slip" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  r <- rawDeposit w alice w.vaultId 1.0 2.0 False now
+  executeRaw w [unfunded r] >>= assertFails (vaultErr "request-expired")
+
+-- | Step 7 before step 8: a request flagged funded, without its allocation,
+-- beyond the vault's capacity.
+test_order_fundingBeforeCapacity : Script ()
+test_order_fundingBeforeCapacity = do
+  w <- setupWorld "o-funding" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  r <- rawDeposit w alice w.vaultId 9999999999999999999999999999.9999999999 0.0 True (addRelTime now (days 1))
+  executeRaw w [unfunded r] >>= assertFails (vaultErr "allocation-mismatch")
+
+-- | Step 7 of the vault, before the delegation: a funded request of the
+-- second vault of the same operator fails as another vault's, not as an
+-- allocation mismatch (T-04).
+test_order_wrongVaultBeforeFunding : Script ()
+test_order_wrongVaultBeforeFunding = do
+  w <- setupWorld "o-t04" Permissioned 0 1
+  let [alice] = w.requesters
+  (_, v) <- vaultOf w
+  second <- submit w.operator $ createCmd v with vaultId = "second"
+  (req, alloc) <- newDeposit w alice 10.0 0.0 True
+  trySubmit (actAs w.operator) (exerciseCmd second Vault_ExecuteDeposits with
+    executor = w.operator; items = [DepositItem with request = req; fundingAllocation = alloc; fundingInputs = []]
+    assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails (vaultErr "wrong-vault")
+
+-- | Step 10 before step 11: an output of zero with `minOut = u`.
+test_order_zeroBeforeSlippage : Script ()
+test_order_zeroBeforeSlippage = do
+  w <- setupWorld "o-zero" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  _ <- run =<< addAssets w 999.0
+  r <- newDeposit w bob 0.0000000999 u False
+  i <- depositItem w bob r
+  tryS (executeDeposits w w.operator [(bob, i)]) >>= assertFails (vaultErr "zero-shares")
+  w10 <- setupWorld "o-zero-10" Permissioned 10 1
+  let [carol] = w10.requesters
+  _ <- run =<< depositAll w10 w10.operator [(carol, 1.0, False)]
+  r <- newRedeem w10 carol 0.9999999999 u False
+  i <- redeemItem w10 carol r
+  tryS (executeRedeems w10 w10.operator [(carol, i)]) >>= assertFails (vaultErr "zero-assets")
+
+-- | Step 11 before step 12 of a redemption: more than `A`, with a `minOut`
+-- above the output.
+test_order_slippageBeforeInsufficient : Script ()
+test_order_slippageBeforeInsufficient = do
+  w <- setupWorld "o-insufficient" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 100.0, False)]
+  _ <- S.mintShares w.shares alice 1000.0 "outside"
+  r <- newRedeem w alice (100.0 + u) (100.0 + u + u) False
+  i <- redeemItem w alice r
+  tryS (executeRedeems w w.operator [(alice, i)]) >>= assertFails (vaultErr "slippage")
+
+-- Phases (`docs/SPEC.md` §5.3)
+-------------------------------
+
+-- | Every request's checks run before any request's allocations: the
+-- first request's funding would fail at its registry, and the second
+-- request fails step 10, which is reported.
+test_order_checksBeforeAllocations : Script ()
+test_order_checksBeforeAllocations = do
+  w <- setupWorld "o-phases" Permissioned 0 3
+  let [alice, bob, carol] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  _ <- run =<< addAssets w 999.0
+  r1 <- newDeposit w bob 10.0 0.0 False
+  r2 <- newDeposit w carol 0.0000000999 0.0 False
+  i2 <- depositItem w carol r2
+  s <- executeDeposits w w.operator [(bob, unfunded (fst r1)), (carol, i2)]
+  attempt s >>= assertFails (vaultErr "zero-shares")
+
+-- Running state
+----------------
+
+-- | At A = 15 and S = 10 (k = 0), the second request of a batch is priced
+-- on the state after the first: one unit differs from the price on the
+-- state before the batch, for a deposit and for a redemption.
+test_order_batchRunningState : Script ()
+test_order_batchRunningState = do
+  w <- setupWorld "o-running-d" Permissioned 0 3
+  let [alice, bob, carol] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  _ <- run =<< addAssets w 5.0
+  (_, v) <- vaultOf w
+  res <- run =<< depositAll w w.operator [(bob, 0.0000145126, False), (carol, 0.0000341364, False)]
+  let s1 = previewDeposit (viewOf v) 0.0000145126
+  res.outputs === [s1, 0.0000227575]
+  previewDeposit (viewOf v) 0.0000341364 === 0.0000227576
+
+  w <- setupWorld "o-running-r" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  _ <- run =<< addAssets w 5.0
+  (_, v) <- vaultOf w
+  (r1, a1) <- newRedeem w alice 0.0000052553 0.0 True
+  (r2, _) <- newRedeem w alice 0.0000116282 0.0 False
+  inputs <- shareInputs w alice
+  held <- sortOn snd <$> accountHoldings w.underlying (basicAccount w.operator)
+  let [(five, 5.0), (ten, 10.0)] = held
+      items =
+        [ (alice, RedeemItem with request = r1; fundingAllocation = a1; fundingInputs = []; vaultInputs = [five])
+        , (alice, RedeemItem with request = r2; fundingAllocation = None; fundingInputs = inputs; vaultInputs = [ten]) ]
+  res <- run =<< executeRedeems w w.operator items
+  res.outputs === [previewRedeem (viewOf v) 0.0000052553, 0.0000174423]
+  previewRedeem (viewOf v) 0.0000116282 === 0.0000174422
+  where
+    viewOf v = view (toInterface @Vault v)
+
+-- Executors of several requesters
+----------------------------------
+
+-- | Permissionless: a batch that holds one of the executor's requests and
+-- one of another requester's is refused; the operator executes any
+-- requester's requests.
+test_order_permissionlessMixedBatch : Script ()
+test_order_permissionlessMixedBatch = do
+  w <- setupWorld "o-mixed" Permissionless 0 2
+  let [alice, bob] = w.requesters
+  da <- newDeposit w alice 10.0 0.0 True
+  db <- newDeposit w bob 10.0 0.0 True
+  ia <- depositItem w alice da
+  ib <- depositItem w bob db
+  rd <- fromSome <$> queryDisclosure alice (fst da)
+  s <- executeDeposits w bob [(bob, ib), (alice, ia)]
+  attempt (s with disclosures = rd :: s.disclosures) >>= assertFails (vaultErr "unauthorized-executor")
+  res <- run =<< executeDeposits w w.operator [(bob, ib), (alice, ia)]
+  res.outputs === [10.0, 10.0]
+
+-- | Permissioned: a redemption executed by a requester is refused before
+-- the request is read.
+test_order_permissionedRedeemExecutor : Script ()
+test_order_permissionedRedeemExecutor = do
+  w <- setupWorld "o-redeem-exec" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  r <- newRedeem w alice 1.0 0.0 False
+  i <- redeemItem w alice r
+  (cid, _) <- vaultOf w
+  vd <- fromSome <$> queryDisclosure w.operator cid
+  trySubmit (actAs bob <> disclose vd) (exerciseCmd cid Vault_ExecuteRedeems with
+    executor = bob; items = [i]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails (vaultErr "unauthorized-executor")
+
+-- Asset additions (`docs/SPEC.md` §5.5)
+----------------------------------------
+
+-- | Add `amount` with the sponsor's pending allocation of the submission.
+addWith : World -> Submission (ContractId VaultState) -> Decimal -> Script (Either SubmitError (ContractId VaultState))
+addWith w s amount = do
+  (cid, _) <- vaultOf w
+  [(funding, _)] <- queryInterface @V2A.Allocation w.sponsor
+  trySubmit (actAs w.operator <> discloseMany s.disclosures) $ exerciseCmd cid Vault_AddAssets with
+    amount; source = basicAccount w.sponsor; funding; assetContext = underlyingArgs w.underlying
+
+-- | Paused before a non-positive amount; a non-positive amount before no
+-- shares; no shares before the capacity; the capacity before the
+-- allocation, which is bound to an earlier vault state.
+test_order_addAssets : Script ()
+test_order_addAssets = do
+  w <- setupWorld "o-add" Permissioned 0 1
+  s <- addAssets w 5.0
+  addWith w s 0.0 >>= assertFails (vaultErr "invalid-amount")
+  addWith w s 9999999999999999999999999999.9999999999 >>= assertFails (vaultErr "no-shares")
+  _ <- run =<< pause w
+  addWith w s 0.0 >>= assertFails (vaultErr "paused")
+  _ <- run =<< unpause w
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  addWith w s 9999999999999999999999999999.9999999999 >>= assertFails (vaultErr "capacity-exceeded")
+
+-- | Step 11 runs for every request before the delegations: the first
+-- request misses its `minOut`, the second outputs zero; slippage is
+-- reported, for deposits and for redemptions.
+test_order_slippageBeforeLaterRequests : Script ()
+test_order_slippageBeforeLaterRequests = do
+  w <- setupWorld "o-slip-d" Permissioned 0 3
+  let [alice, bob, carol] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  _ <- run =<< addAssets w 999.0
+  r1 <- newDeposit w bob 1.0 1.0 False
+  i1 <- depositItem w bob r1
+  r2 <- newDeposit w carol 0.0000000999 0.0 False
+  i2 <- depositItem w carol r2
+  tryS (executeDeposits w w.operator [(bob, i1), (carol, i2)]) >>= assertFails (vaultErr "slippage")
+  w10 <- setupWorld "o-slip-r" Permissioned 10 2
+  let [dave, erin] = w10.requesters
+  _ <- run =<< depositAll w10 w10.operator [(dave, 1.0, False), (erin, 1.0, False)]
+  q1 <- newRedeem w10 dave 1.0 1.0 False
+  j1 <- redeemItem w10 dave q1
+  q2 <- newRedeem w10 erin 0.9999999999 0.0 False
+  j2 <- redeemItem w10 erin q2
+  tryS (executeRedeems w10 w10.operator [(dave, j1), (erin, j2)]) >>= assertFails (vaultErr "slippage")
+
+-- | Every request's allocations are made before any settlement (`docs/SPEC.md` §5.3). The
+-- second redemption names as its input the share holding that the first
+-- request's funding allocation locked. Its allocation fails at the share
+-- registry because the holding is still locked; settling the first request
+-- first would have consumed the holding instead.
+test_order_allocationsBeforeSettlements : Script ()
+test_order_allocationsBeforeSettlements = do
+  w <- setupWorld "o-settle" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 6.0, False)]
+  _ <- run =<< depositAll w w.operator [(alice, 4.0, False)]
+  (r1, a1) <- newRedeem w alice 4.0 0.0 True
+  (r2, _) <- newRedeem w alice 1.0 0.0 False
+  holdings <- S.holdingsOf w.shares alice
+  held <- sortOn snd <$> accountHoldings w.underlying (basicAccount w.operator)
+  let [lockedHolding] = [ toInterfaceContractId cid | (cid, h) <- holdings, isSome h.lock ]
+      [(four, 4.0), (six, 6.0)] = held
+      items =
+        [ (alice, RedeemItem with request = r1; fundingAllocation = a1; fundingInputs = []; vaultInputs = [four])
+        , (alice, RedeemItem with request = r2; fundingAllocation = None; fundingInputs = [lockedHolding]; vaultInputs = [six]) ]
+  tryS (executeRedeems w w.operator items)
+    >>= assertFails (Status "cayvox.com/registry-invalid-input-holding" InvalidGivenCurrentSystemStateOther)
+
+-- | Each redemption of a batch pays from its own vault-account holdings
+-- (`docs/SPEC.md` §5.4): an allocation consumes its inputs, so a holding
+-- named by two redemptions is no longer active for the second, and the
+-- whole batch fails; with a holding each, the same batch executes.
+test_order_redemptionsNeedSeparateVaultHoldings : Script ()
+test_order_redemptionsNeedSeparateVaultHoldings = do
+  w <- setupWorld "o-shared" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 6.0, False)]
+  _ <- run =<< depositAll w w.operator [(bob, 4.0, False)]
+  held <- sortOn snd <$> accountHoldings w.underlying (basicAccount w.operator)
+  let [(four, 4.0), (six, 6.0)] = held
+  (ra, _) <- newRedeem w alice 1.0 0.0 False
+  (rb, _) <- newRedeem w bob 1.0 0.0 False
+  ia <- shareInputs w alice
+  ib <- shareInputs w bob
+  let item r inputs vaultInputs = RedeemItem with request = r; fundingAllocation = None; fundingInputs = inputs; vaultInputs
+  tryS (executeRedeems w w.operator [(alice, item ra ia [six]), (bob, item rb ib [six])])
+    >>= assertFails (ContractUnavailable (show six))
+  res <- run =<< executeRedeems w w.operator [(alice, item ra ia [six]), (bob, item rb ib [four])]
+  res.outputs === [1.0, 1.0]
+
+-- | `docs/SPEC.md` §5.4: a redemption's vault allocation is funded by
+-- its own vault holdings and by the change of the batch's previous
+-- redemption, so one large holding pays a whole batch.
+test_order_redemptionsChainChange : Script ()
+test_order_redemptionsChainChange = do
+  w <- setupWorld "o-chain" Permissioned 0 3
+  let [alice, bob, carol] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  _ <- run =<< depositAll w w.operator [(bob, 1.0, False)]
+  _ <- run =<< depositAll w w.operator [(carol, 1.0, False)]
+  held <- sortOn snd <$> accountHoldings w.underlying (basicAccount w.operator)
+  let ten = fst (last held)
+  snd (last held) === 10.0
+  (ra, _) <- newRedeem w alice 2.0 0.0 False
+  (rb, _) <- newRedeem w bob 1.0 0.0 False
+  (rc, _) <- newRedeem w carol 1.0 0.0 False
+  ia <- shareInputs w alice
+  ib <- shareInputs w bob
+  ic <- shareInputs w carol
+  let item r inputs vaultInputs = RedeemItem with request = r; fundingAllocation = None; fundingInputs = inputs; vaultInputs
+  res <- run =<< executeRedeems w w.operator
+    [(alice, item ra ia [ten]), (bob, item rb ib []), (carol, item rc ic [])]
+  res.outputs === [2.0, 1.0, 1.0]
+  after <- accountHoldings w.underlying (basicAccount w.operator)
+  sum (map snd after) === 8.0
+  (_, v) <- vaultOf w
+  (v.totalAssets, v.totalShares) === (8.0, 8.0)
+  -- Each receiver got its own output.
+  received <- forA [alice, bob, carol] (fmap fst . underlyingBalance w.underlying)
+  received === [992.0, 1000.0, 1000.0]
+
+-- | The same in Permissionless mode: the requester executes its own two
+-- funded requests, and the operator discloses one vault holding.
+test_order_redemptionsChainChange_permissionless : Script ()
+test_order_redemptionsChainChange_permissionless = do
+  w <- setupWorld "o-chain-pl" Permissionless 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w alice [(alice, 10.0, False)]
+  [(ten, 10.0)] <- accountHoldings w.underlying (basicAccount w.operator)
+  r1 <- newRedeem w alice 3.0 0.0 True
+  r2 <- newRedeem w alice 4.0 0.0 True
+  i1 <- redeemItem w alice r1
+  i2 <- redeemItem w alice r2
+  res <- run =<< executeRedeems w alice [(alice, i1 with vaultInputs = [ten]), (alice, i2 with vaultInputs = [])]
+  res.outputs === [3.0, 4.0]
+  [(_, 3.0)] <- accountHoldings w.underlying (basicAccount w.operator)
+  (received, _) <- underlyingBalance w.underlying alice
+  received === 997.0
+
+-- | When the operator executes, checks 2 to 4 need no
+-- request content and run before any request is read, so a paused vault
+-- answers `vault-paused` even for a batch whose request is archived
+-- (`docs/SPEC.md` §5.3).
+test_order_batchChecksBeforeRead : Script ()
+test_order_batchChecksBeforeRead = do
+  w <- setupWorld "o-before-read" Permissioned 0 1
+  let [alice] = w.requesters
+  r <- newDeposit w alice 1.0 0.0 False
+  item <- depositItem w alice r
+  submit alice $ archiveCmd (fst r)
+  _ <- run =<< pause w
+  tryS (executeDeposits w w.operator [(alice, item)]) >>= assertFails (vaultErr "paused")
+  tryS (executeDeposits w w.operator (replicate 26 (alice, item))) >>= assertFails (vaultErr "paused")
+  _ <- run =<< unpause w
+  tryS (executeDeposits w w.operator (replicate 26 (alice, item))) >>= assertFails (vaultErr "batch-size")
+  tryS (executeDeposits w w.operator [(alice, item), (alice, item)]) >>= assertFails (vaultErr "duplicate-request")

@@ -1,0 +1,721 @@
+-- | The share registry: the vault operator's registry for its share
+-- instrument, implementing the Canton Token Standard V2 interfaces for
+-- holdings, transfers, allocations, settlement and events (D-07; SPEC §4.3,
+-- §8). `docs/REGISTRY-MUSTS.md` lists every requirement it meets and where.
+--
+-- Authority. The operator is the instrument admin. Every share holding is
+-- signed by the admin and its owner, and its owner is never the admin, so no
+-- party can create shares alone (T-13). Shares enter and leave only through
+-- `Allocation_Settle`, which needs the admin: in a settlement of both sides
+-- of every leg, only by legs from `cip-112/mint` or to `cip-112/burn`; the
+-- admin can also settle one side alone, which changes the supply and breaks
+-- I-02 (`docs/SPEC.md` §4.3). Every other choice moves, locks or unlocks
+-- existing shares.
+--
+-- Privacy. An account's provider observes the account's holdings,
+-- allocations, transfer instructions and events (`HoldingV2.daml:37-38`). The
+-- executors of a settlement observe its allocations.
+--
+-- Caller-supplied contracts. Input holdings and allocations are read with a
+-- typed fetch of this module's templates, never through their interface
+-- alone: an allocation's settle choice runs with the admin's authority (T-06).
+--
+-- Events. Every create or archive of a share holding appears in exactly one
+-- `EventLog_HoldingsChange` for its account (`[CIP112]:1246`). The event is
+-- reported through a `ShareEventLog` that is signed by the admin and the
+-- account owner, created inside the registry operation, and archived by its
+-- own event, so no standing event log can be called directly (T-12).
+module Cayvox.VaultV1.Internal.ShareRegistry
+  ( -- * Templates
+    ShareRules (..)
+  , ShareHolding (..)
+  , ShareAllocation (..)
+  , ShareTransferInstruction (..)
+  , ShareEventLog (..)
+    -- * Bounds (T-16)
+  , maxTextLength
+  , maxMetaEntries
+  , maxMetaValueLength
+  , maxLegs
+  , maxExecutors
+  , maxInputs
+  , boundedText
+  , boundedMeta
+  , boundedTransfer
+    -- * Checks
+  , inputHoldingUsable
+  , isRegularAccount
+  , isSpecialAccount
+  ) where
+
+import DA.Action (void)
+import DA.Foldable (forA_)
+import DA.List (dedupSort)
+import qualified DA.Map as Map
+import DA.Optional (fromOptional, fromSome, isNone, isSome, optionalToList)
+import qualified DA.Set as Set
+import qualified DA.Text as T
+import qualified DA.TextMap as TextMap
+import DA.Time (isLedgerTimeLT)
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferEventsV2 as Events
+import Splice.Api.Token.TransferInstructionV2
+
+import Cayvox.VaultV1.Internal.Failure
+import Cayvox.VaultV1.Internal.TokenStandard
+
+-- Bounds (T-16)
+----------------
+
+-- | The longest identifier or text field, in characters.
+maxTextLength : Int
+maxTextLength = 256
+
+-- | The most entries in a `Metadata` value.
+maxMetaEntries : Int
+maxMetaEntries = 16
+
+-- | The longest metadata value, in characters.
+maxMetaValueLength : Int
+maxMetaValueLength = 1024
+
+-- | The most leg sides in one allocation (`allocation-instruction-v2.yaml:21-29`).
+maxLegs : Int
+maxLegs = 25
+
+-- | The most executors of a settlement.
+maxExecutors : Int
+maxExecutors = 10
+
+-- | The most input holdings of one transfer.
+maxInputs : Int
+maxInputs = 50
+
+-- | Text within the bound.
+boundedText : Text -> Bool
+boundedText t = T.length t <= maxTextLength
+
+-- | Metadata within the bounds.
+boundedMeta : Metadata -> Bool
+boundedMeta meta =
+  let entries = TextMap.toList meta.values
+  in length entries <= maxMetaEntries
+     && all (\(k, v) -> boundedText k && T.length v <= maxMetaValueLength) entries
+
+boundedAccount : Account -> Bool
+boundedAccount account = boundedText account.id
+
+boundedLegSide : TransferLegSide -> Bool
+boundedLegSide leg =
+  boundedText leg.transferLegId && boundedAccount leg.otherside && boundedText leg.instrumentId && boundedMeta leg.meta
+
+boundedSettlement : SettlementInfo -> Bool
+boundedSettlement settlement =
+  not (null settlement.executors) && length settlement.executors <= maxExecutors
+    && boundedText settlement.id && boundedMeta settlement.meta
+
+boundedLock : Lock -> Bool
+boundedLock lock =
+  not (null lock.holders) && length lock.holders <= maxExecutors
+    && Set.size (Set.fromList lock.holders) == length lock.holders
+    && optional True boundedText lock.context
+
+boundedTransfer : Transfer -> Bool
+boundedTransfer transfer =
+  boundedAccount transfer.sender && boundedAccount transfer.receiver
+    && boundedText transfer.instrumentId.id && boundedMeta transfer.meta
+    && length transfer.inputHoldingCids <= maxInputs
+
+-- Accounts
+-----------
+
+-- | A regular account: an owner that is not the admin (T-13).
+isRegularAccount : Party -> Account -> Bool
+isRegularAccount admin account = isSome account.owner && account.owner /= Some admin
+
+-- | One of the two special accounts the registry uses (`[CIP112]:622-625`).
+isSpecialAccount : Account -> Bool
+isSpecialAccount account = account == mintAccount || account == burnAccount
+
+-- | The provider of an account, when set and different from the owner.
+providerOf : Account -> [Party]
+providerOf account = case account.provider of
+  Some provider | Some provider /= account.owner -> [provider]
+  _ -> []
+
+-- | The owner of a regular account, if any.
+ownerOf : Account -> [Party]
+ownerOf account = optionalToList account.owner
+
+-- | Groups of an account's parties that may act for it: the principal alone
+-- or with the provider; the provider alone only when `providerAlone`.
+actorGroups : Bool -> Party -> Account -> [[Party]]
+actorGroups providerAlone admin account = case accountParties admin account of
+  [principal, provider] -> [[principal], [principal, provider]] ++ [[provider] | providerAlone]
+  parties -> [parties]
+
+-- Holdings
+-----------
+
+-- | A holding of the share instrument in a regular account. The registry's
+-- allocations and transfers move, lock and unlock it; it defines only the
+-- `Archive` choice, controlled by its signatories.
+--
+-- * Signatories: the admin and the owner. Observers: the account's provider
+--   and, while locked, the parties that act on the lock: the executors of the
+--   allocation it funds, or the receiver's parties of the pending transfer,
+--   so that they settle, cancel, accept or reject without disclosure.
+-- * `ensure`: a positive amount, this admin's instrument, a regular account
+--   whose owner is not the admin (T-13), a lock with unique holders, lock
+--   observers only while locked, and bounded fields (T-16). A create that
+--   breaks it fails with `PreconditionFailed`.
+-- * Archival: by the registry operation that spends, locks or unlocks it,
+--   which reports the change in one holdings-change event.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template ShareHolding
+  with
+    admin : Party
+      -- ^ The instrument admin, the vault operator.
+    instrumentId : InstrumentId
+      -- ^ The share instrument.
+    account : Account
+      -- ^ The account that holds the shares.
+    amount : Decimal
+      -- ^ The number of shares.
+    lock : Optional Lock
+      -- ^ A lock held by the admin while the shares back an allocation or a
+      -- pending transfer.
+    lockObservers : [Party]
+      -- ^ The parties that act on the lock; empty when unlocked.
+    meta : Metadata
+      -- ^ Metadata.
+  where
+    signatory admin :: ownerOf account
+    observer providerOf account ++ lockObservers
+    ensure amount > 0.0
+      && instrumentId.admin == admin && boundedText instrumentId.id
+      && isRegularAccount admin account && boundedAccount account
+      && optional True boundedLock lock
+      && (isSome lock || null lockObservers) && length lockObservers <= maxExecutors + 2
+      && boundedMeta meta
+
+    interface instance Holding for ShareHolding where
+      view = HoldingView with account; instrumentId; amount; lock; meta
+
+-- | Whether an input holding may fund a transfer or an allocation at the
+-- given time: unlocked, or with a lock whose `expiresAt` has been reached
+-- ("Absolute, inclusive deadline", `HoldingV2.daml:54`; SHOULD of `:85-86`).
+inputHoldingUsable : Time -> ShareHolding -> Bool
+inputHoldingUsable now holding = case holding.lock of
+  None -> True
+  Some lock -> case lock.expiresAt of
+    Some expiresAt -> now >= expiresAt
+    None -> False
+
+-- | Read the caller's input holdings with a typed fetch, and require each to
+-- be a usable share holding of this instrument in the given account.
+validateInputHoldings : InstrumentId -> Account -> [ContractId Holding] -> Update [(ContractId ShareHolding, ShareHolding)]
+validateInputHoldings instrumentId account holdingCids = do
+  now <- getTime
+  forA holdingCids $ \cid -> do
+    let shareCid = fromInterfaceContractId @ShareHolding cid
+    holding <- fetch shareCid
+    require registryInvalidInputHolding
+      (holding.instrumentId == instrumentId && holding.account == account && inputHoldingUsable now holding)
+    pure (shareCid, holding)
+
+-- | Create an unlocked holding for a regular account.
+createHolding : Party -> InstrumentId -> Account -> Decimal -> Update (ContractId ShareHolding)
+createHolding admin instrumentId account amount =
+  create ShareHolding with admin; instrumentId; account; amount; lock = None; lockObservers = []; meta = emptyMetadata
+
+-- | Create a holding locked by the admin, observed by the parties that act
+-- on the lock.
+createLockedHolding : Party -> InstrumentId -> Account -> Decimal -> Text -> [Party] -> Update (ContractId ShareHolding)
+createLockedHolding admin instrumentId account amount context lockObservers =
+  create ShareHolding with
+    admin; instrumentId; account; amount
+    lock = Some (registryLock admin context)
+    lockObservers = dedupSort lockObservers
+    meta = emptyMetadata
+
+-- | The lock that backs an allocation or a pending transfer.
+registryLock : Party -> Text -> Lock
+registryLock admin context = Lock with
+  holders = [admin]
+  expiresAt = None
+  expiresAfter = None
+  context = Some (T.take maxTextLength context)
+
+-- Events
+---------
+
+-- | The one-shot event log through which the admin reports a change in the
+-- holdings of a regular account.
+--
+-- * Signatories: the admin and the account owner. Observer: the provider.
+-- * Created inside a registry operation, where both authorities are present,
+--   and archived by its own `EventLog_HoldingsChange`, so every event comes
+--   from a registry operation and every log is short-lived (T-12).
+-- * `EventLog_HoldingsChange`: controlled by the event's `admin`; fails with
+--   `registry-wrong-admin`, `registry-invalid-account` or
+--   `registry-unauthorized-actors` (observers without the account parties).
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template ShareEventLog
+  with
+    admin : Party
+      -- ^ The instrument admin.
+    account : Account
+      -- ^ The regular account whose holdings changed.
+  where
+    signatory admin :: ownerOf account
+    observer providerOf account
+    ensure isRegularAccount admin account && boundedAccount account
+
+    interface instance Events.EventLog for ShareEventLog where
+      view = Events.EventLogView with admin; meta = emptyMetadata
+      eventLog_holdingsChangeImpl self arg = do
+        archive (fromInterfaceContractId @ShareEventLog self)
+        require registryWrongAdmin (arg.admin == admin)
+        require registryInvalidAccount (arg.account == account)
+        require registryUnauthorizedActors (all (`elem` arg.observers) (accountParties admin account))
+        pure Events.EventLog_HoldingsChangeResult
+
+-- | Report a holdings change through a fresh `ShareEventLog`.
+emitEvent : Events.EventLog_HoldingsChange -> Update ()
+emitEvent arg = do
+  logCid <- create ShareEventLog with admin = arg.admin; account = arg.account
+  void (exercise (toInterfaceContractId @Events.EventLog logCid) arg)
+
+-- | Report a change of an account's holdings not caused by a transfer: a lock
+-- or an unlock.
+logMergeSplit : Party -> Account -> [ContractId ShareHolding] -> Text -> [ContractId ShareHolding] -> Update ()
+logMergeSplit admin account inputs reason outputs =
+  logHoldingsChange emitEvent Events.EventLog_HoldingsChange with
+    admin
+    account
+    inputHoldingCids = map toInterfaceContractId inputs
+    transferLegSides = []
+    outputHoldingCids = map toInterfaceContractId outputs
+    observers = accountParties admin account
+    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = reasonMeta reason
+
+-- | Report a transfer: one event per account, each side with its holdings,
+-- or one event with both sides for a transfer to oneself.
+logTransfer : Party -> Transfer -> [ContractId ShareHolding] -> [ContractId ShareHolding] -> [ContractId ShareHolding] -> Update ()
+logTransfer admin transfer senderInputs senderOutputs receiverOutputs = do
+  let leg side otherside = Events.TransferLegSide with
+        transferLegId = ""
+        side
+        otherside
+        amount = transfer.amount
+        instrumentId = transfer.instrumentId.id
+        meta = transfer.meta
+      out = leg Events.SenderSide transfer.receiver
+      into = leg Events.ReceiverSide transfer.sender
+      event account inputs legs outputs = Events.EventLog_HoldingsChange with
+        admin
+        account
+        inputHoldingCids = map toInterfaceContractId inputs
+        transferLegSides = legs
+        outputHoldingCids = map toInterfaceContractId outputs
+        observers = accountParties admin account
+        extraArgs = ExtraArgs with context = emptyChoiceContext; meta = reasonMeta "transfer"
+  if transfer.sender == transfer.receiver
+    then logHoldingsChange emitEvent (event transfer.sender senderInputs [out, into] (senderOutputs ++ receiverOutputs))
+    else do
+      logHoldingsChange emitEvent (event transfer.sender senderInputs [out] senderOutputs)
+      logHoldingsChange emitEvent (event transfer.receiver [] [into] receiverOutputs)
+
+-- Allocations
+--------------
+
+-- | An allocation of the share instrument: the authorizer's approval to send
+-- or receive the net amount of its leg sides in one settlement. A sending
+-- allocation holds its funds in a locked holding.
+--
+-- * Signatories: the admin and, for a regular account, its owner.
+--   Observers: the settlement's executors and the account's provider.
+-- * Settle: the admin and the executors, before the settlement deadline;
+--   through `SettlementFactory_SettleBatch`. Cancel: the executors.
+--   Withdraw: the authorizer's owner or provider; a committed allocation only
+--   after its deadline. Each consumes the allocation; cancel and withdraw
+--   return the locked funds to the authorizer.
+-- * Failures: `registry-unauthorized-actors`, `registry-iterated-settlement`,
+--   `registry-deadline-passed`, `registry-committed-allocation`.
+-- * Settlement is single-iteration (D-07), and the allocation stays valid
+--   until it is consumed. A committed allocation carries a settlement
+--   deadline, after which its authorizer can withdraw it.
+-- * `ensure`: this admin's instrument; a regular authorizer, or a special one
+--   on its own side only (`cip-112/mint` sends, `cip-112/burn` receives);
+--   positive leg amounts; no next-iteration funding; a deadline when
+--   committed; bounded fields. A create that breaks it fails with
+--   `PreconditionFailed`, so settling never meets a leg it cannot pay.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template ShareAllocation
+  with
+    admin : Party
+      -- ^ The instrument admin.
+    instrumentId : InstrumentId
+      -- ^ The share instrument.
+    settlement : SettlementInfo
+      -- ^ The settlement this allocation is for.
+    allocation : AllocationSpecification
+      -- ^ What the authorizer approves.
+    lockedHoldingCid : Optional (ContractId ShareHolding)
+      -- ^ The locked holding that funds a net send, if any.
+    createdAt : Time
+      -- ^ When the allocation was created.
+  where
+    signatory admin :: ownerOf allocation.authorizer
+    observer settlement.executors ++ providerOf allocation.authorizer
+    ensure allocation.admin == admin && instrumentId.admin == admin
+      && boundedSettlement settlement
+      && not (null allocation.transferLegSides) && length allocation.transferLegSides <= maxLegs
+      && all boundedLegSide allocation.transferLegSides
+      && all (\leg -> leg.amount > 0.0 && sideAllowed allocation.authorizer leg.side) allocation.transferLegSides
+      && isNone allocation.nextIterationFunding
+      && (not allocation.committed || isSome allocation.settlementDeadline)
+      && (isRegularAccount admin allocation.authorizer || isSpecialAccount allocation.authorizer)
+      && boundedAccount allocation.authorizer && boundedMeta allocation.meta
+
+    interface instance Allocation for ShareAllocation where
+      view = AllocationView with
+        originalAllocationCid = None
+        settlement
+        allocation
+        holdingCids = map toInterfaceContractId (optionalToList lockedHoldingCid)
+        createdAt
+        numIterations = 0
+        expiresAt = None
+        availableActions = Map.fromList $
+          [ (AA_Settle, [dedupSort (admin :: settlement.executors)])
+          , (AA_Cancel, [dedupSort settlement.executors]) ] ++
+          [ (AA_Withdraw, actorGroups True admin allocation.authorizer)
+          | not allocation.committed || isSome allocation.settlementDeadline ]
+        meta = emptyMetadata
+
+      allocation_settleExtraObservers _ = []
+      allocation_cancelExtraObservers _ = []
+      allocation_withdrawExtraObservers _ = []
+
+      allocation_settleImpl self arg = do
+        archive (fromInterfaceContractId @ShareAllocation self)
+        checkActors arg.actors [admin :: settlement.executors]
+        validateNextIterationArgs False arg.extraTransferLegSides arg.nextIterationFunding
+        forA_ allocation.settlementDeadline $ \deadline -> do
+          open <- isLedgerTimeLT deadline
+          require registryDeadlinePassed open
+        -- The `ensure` lets a special account take only the side whose net
+        -- credit is zero, with positive amounts (`sideAllowed`,
+        -- `netAllocationCreditAmounts`), so a holding is created only for a
+        -- regular account.
+        let net = netCredit instrumentId allocation
+        inputs <- case lockedHoldingCid of
+          Some cid -> archive cid >> pure [cid]
+          None -> pure []
+        outputs <-
+          if net > 0.0
+            then (:: []) <$> createHolding admin instrumentId allocation.authorizer net
+            else pure []
+        logAllocationSettlement emitEvent (map toInterfaceContractId inputs) allocation (map toInterfaceContractId outputs)
+        pure AllocationResult with
+          output = AllocationResult_Settled with nextIterationAllocationCid = None
+          authorizerHoldingCids = TextMap.fromList [(instrumentId.id, map toInterfaceContractId outputs)]
+          meta = emptyMetadata
+
+      allocation_cancelImpl self arg = do
+        archive (fromInterfaceContractId @ShareAllocation self)
+        cancelAllocation (view (toInterface @Allocation this)) arg.actors
+          (unlockAllocation this "cancel allocation")
+
+      allocation_withdrawImpl self arg = do
+        archive (fromInterfaceContractId @ShareAllocation self)
+        withdrawAllocation (view (toInterface @Allocation this)) arg.actors
+          (unlockAllocation this "withdraw allocation")
+
+-- | The net credit of an allocation in the share instrument.
+netCredit : InstrumentId -> AllocationSpecification -> Decimal
+netCredit instrumentId allocation =
+  fromOptional 0.0 (TextMap.lookup instrumentId.id (netAllocationCreditAmounts allocation.authorizer allocation.transferLegSides))
+
+-- | Release an allocation's locked holding to its authorizer.
+unlockAllocation : ShareAllocation -> Text -> Update (TextMap.TextMap [ContractId Holding])
+unlockAllocation this reason = case this.lockedHoldingCid of
+  None -> pure TextMap.empty
+  Some lockedCid -> do
+    locked <- fetch lockedCid
+    archive lockedCid
+    released <- createHolding this.admin this.instrumentId this.allocation.authorizer locked.amount
+    logMergeSplit this.admin this.allocation.authorizer [lockedCid] reason [released]
+    pure (TextMap.fromList [(this.instrumentId.id, [toInterfaceContractId released])])
+
+-- Transfers
+------------
+
+-- | A pending transfer: the sender's shares are locked until the receiver
+-- accepts or rejects it, or the sender withdraws it.
+--
+-- * Signatories: the admin and the sender's owner. Observers: the receiver's
+--   owner and provider, and the sender's provider.
+-- * Accept: the receiver's owner, alone or with its provider, before
+--   `executeBefore`. Reject: the receiver's owner or provider. Withdraw: the
+--   sender's owner or provider. Each archives the instruction; reject and
+--   withdraw return the locked shares to the sender.
+-- * Failures: `registry-unauthorized-actors`, `registry-deadline-passed`.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template ShareTransferInstruction
+  with
+    admin : Party
+      -- ^ The instrument admin.
+    transfer : Transfer
+      -- ^ The instructed transfer.
+    lockedHoldingCid : ContractId ShareHolding
+      -- ^ The sender's locked shares.
+  where
+    signatory admin :: ownerOf transfer.sender
+    observer ownerOf transfer.receiver ++ providerOf transfer.receiver ++ providerOf transfer.sender
+    ensure transfer.instrumentId.admin == admin && transfer.amount > 0.0
+      && isRegularAccount admin transfer.sender && isRegularAccount admin transfer.receiver
+      && boundedTransfer transfer
+
+    interface instance TransferInstruction for ShareTransferInstruction where
+      view = TransferInstructionView with
+        originalInstructionCid = None
+        transfer
+        expiresAt = Some transfer.executeBefore
+        availableActions = Map.fromList
+          [ (TIA_Accept, actorGroups False admin transfer.receiver)
+          , (TIA_Reject, actorGroups True admin transfer.receiver)
+          , (TIA_Withdraw, actorGroups True admin transfer.sender) ]
+        meta = emptyMetadata
+
+      transferInstruction_acceptExtraObservers _ = []
+      transferInstruction_rejectExtraObservers _ = []
+      transferInstruction_withdrawExtraObservers _ = []
+
+      transferInstruction_acceptImpl self arg = do
+        archive (fromInterfaceContractId @ShareTransferInstruction self)
+        checkActors arg.actors (actorGroups False admin transfer.receiver)
+        open <- isLedgerTimeLT transfer.executeBefore
+        require registryDeadlinePassed open
+        archive lockedHoldingCid
+        received <- createHolding admin transfer.instrumentId transfer.receiver transfer.amount
+        logTransfer admin transfer [lockedHoldingCid] [] [received]
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with receiverHoldingCids = [toInterfaceContractId received]
+          senderChangeCids = []
+          meta = emptyMetadata
+
+      transferInstruction_rejectImpl self arg = do
+        archive (fromInterfaceContractId @ShareTransferInstruction self)
+        checkActors arg.actors (actorGroups True admin transfer.receiver)
+        returnToSender this "reject transfer"
+
+      transferInstruction_withdrawImpl self arg = do
+        archive (fromInterfaceContractId @ShareTransferInstruction self)
+        checkActors arg.actors (actorGroups True admin transfer.sender)
+        returnToSender this "withdraw transfer"
+
+-- | Unlock a pending transfer's shares back to the sender.
+returnToSender : ShareTransferInstruction -> Text -> Update TransferInstructionResult
+returnToSender this reason = do
+  archive this.lockedHoldingCid
+  returned <- createHolding this.admin this.transfer.instrumentId this.transfer.sender this.transfer.amount
+  logMergeSplit this.admin this.transfer.sender [this.lockedHoldingCid] reason [returned]
+  pure TransferInstructionResult with
+    output = TransferInstructionResult_Failed
+    senderChangeCids = [toInterfaceContractId returned]
+    meta = emptyMetadata
+
+-- Factories
+------------
+
+-- | The share registry's factories for one share instrument: allocation,
+-- settlement and transfer. It holds no state beyond its instrument.
+--
+-- * Signatory: the admin, the vault operator. It is disclosed to the parties
+--   that use it (SPEC §2).
+-- * `ensure`: the instrument's admin is the signatory; bounded fields.
+-- * `AllocationFactory_Allocate`: the authorizer's principal, alone or with
+--   the provider; creates the allocation directly.
+-- * `SettlementFactory_SettleBatch`: the settlement's executors.
+-- * `TransferFactory_Transfer`: the sender's owner, alone or with its
+--   provider; completes at once when the receiver's owner also acts.
+-- * Failures: every check fails with a `cayvox.com/registry-...` identifier
+--   of category `InvalidGivenCurrentSystemStateOther` (`Failure.daml`).
+-- * Archival: the admin's `Archive` ends new allocations, batch settlements
+--   and transfers; existing allocations and pending instructions keep their
+--   own choices.
+-- * Upgrades: fields are added only as `Optional` (SCU).
+template ShareRules
+  with
+    admin : Party
+      -- ^ The instrument admin, the vault operator.
+    instrumentId : InstrumentId
+      -- ^ The share instrument; its admin is `admin`.
+    meta : Metadata
+      -- ^ Metadata of the factories' views.
+  where
+    signatory admin
+    ensure instrumentId.admin == admin && not (T.isEmpty instrumentId.id) && boundedText instrumentId.id
+      && boundedMeta meta
+
+    interface instance AllocationFactory for ShareRules where
+      view = AllocationFactoryView with admin; meta
+      allocationFactory_allocateExtraObservers arg =
+        arg.settlement.executors ++ accountParties admin arg.allocation.authorizer
+      allocationFactory_publicFetchImpl _self _arg = publicFetch (AllocationFactoryView with admin; meta)
+      allocationFactory_allocateImpl _self arg = allocateImpl this arg
+
+    interface instance SettlementFactory for ShareRules where
+      view = SettlementFactoryView with admin; meta
+      settlementFactory_settleBatchExtraObservers = settleBatchExtraObservers
+      settlementFactory_publicFetchImpl _self _arg = publicFetch (SettlementFactoryView with admin; meta)
+      settlementFactory_settleBatchImpl _self arg = do
+        forA_ arg.transferLegs $ \leg -> require registryWrongInstrument (leg.instrumentId == instrumentId.id)
+        settleBatch admin (fetchShareAllocationView instrumentId) settleShareAllocation arg
+
+    interface instance TransferFactory for ShareRules where
+      view = TransferFactoryView with admin; meta
+      transferFactory_transferExtraObservers _ = []
+      transferFactory_publicFetchImpl _self _arg = publicFetch (TransferFactoryView with admin; meta)
+      transferFactory_transferImpl _self arg = transferImpl this arg
+
+-- | Read an allocation of this instrument with a typed fetch (T-06).
+fetchShareAllocationView : InstrumentId -> ContractId Allocation -> Update AllocationView
+fetchShareAllocationView instrumentId cid = do
+  shareAllocation <- fetch (fromInterfaceContractId @ShareAllocation cid)
+  require registryWrongInstrument (shareAllocation.instrumentId == instrumentId)
+  pure (view (toInterface @Allocation shareAllocation))
+
+-- | Settle one allocation, already fetched as a `ShareAllocation`.
+settleShareAllocation : FinalizedAllocation -> Allocation_Settle -> Update AllocationResult
+settleShareAllocation finalized arg = exercise finalized.allocationCid arg
+
+-- | Check an account used in an allocation or a transfer.
+validateAccount : Party -> Bool -> Account -> Update ()
+validateAccount admin allowSpecial account = do
+  require registryFieldTooLarge (boundedAccount account)
+  require registryInvalidAccount (isRegularAccount admin account || (allowSpecial && isSpecialAccount account))
+
+-- | `AllocationFactory_Allocate` (`AllocationInstructionV2.daml:148-182`).
+allocateImpl : ShareRules -> AllocationFactory_Allocate -> Update AllocationInstructionResult
+allocateImpl rules arg = do
+  let admin = rules.admin
+      spec = arg.allocation
+      authorizer = spec.authorizer
+  require registryWrongAdmin (spec.admin == admin)
+  validateAccount admin True authorizer
+  checkActors arg.actors (actorGroups False admin authorizer)
+  notYet <- isLedgerTimeLT arg.requestedAt
+  require registryNotYetRequested (not notYet)
+  require registryFieldTooLarge (boundedSettlement arg.settlement && boundedMeta spec.meta)
+  require registryNoTransferLegs (not (null spec.transferLegSides))
+  require registryFieldTooLarge (length spec.transferLegSides <= maxLegs && all boundedLegSide spec.transferLegSides)
+  forA_ spec.transferLegSides $ \leg -> do
+    require registryInvalidAmount (leg.amount > 0.0)
+    require registryWrongInstrument (leg.instrumentId == rules.instrumentId.id)
+    validateAccount admin True leg.otherside
+    require registryInvalidAccount (sideAllowed authorizer leg.side)
+  require registryDuplicateLeg
+    (Set.size (Set.fromList [ (leg.transferLegId, leg.side) | leg <- spec.transferLegSides ]) == length spec.transferLegSides)
+  require registryIteratedSettlement (isNone spec.nextIterationFunding)
+  require registryCommittedWithoutDeadline (not spec.committed || isSome spec.settlementDeadline)
+  forA_ spec.settlementDeadline $ \deadline -> do
+    open <- isLedgerTimeLT deadline
+    require registryDeadlinePassed open
+  let needed = negate (min 0.0 (netCredit rules.instrumentId spec))
+  (lockedHoldingCid, changeCids) <-
+    if needed == 0.0
+      then do
+        -- Unused inputs are returned as the authorizer's change, so they
+        -- are validated too (`test_allocate_refusesForeignUnusedInputs`).
+        _ <- validateInputHoldings rules.instrumentId authorizer arg.inputHoldingCids
+        pure (None, arg.inputHoldingCids)
+      else do
+        inputs <- validateInputHoldings rules.instrumentId authorizer arg.inputHoldingCids
+        let total = sum (map (\(_, holding) -> holding.amount) inputs)
+        require registryInsufficientFunds (total >= needed)
+        forA_ inputs $ \(cid, _) -> archive cid
+        locked <- createLockedHolding admin rules.instrumentId authorizer needed
+          ("allocation " <> arg.settlement.id) arg.settlement.executors
+        change <- if total > needed
+          then (:: []) <$> createHolding admin rules.instrumentId authorizer (total - needed)
+          else pure []
+        logMergeSplit admin authorizer (map fst inputs) "allocate" (locked :: change)
+        pure (Some locked, map toInterfaceContractId change)
+  now <- getTime
+  allocationCid <- create ShareAllocation with
+    admin
+    instrumentId = rules.instrumentId
+    settlement = arg.settlement
+    allocation = spec
+    lockedHoldingCid
+    createdAt = now
+  pure AllocationInstructionResult with
+    output = AllocationInstructionResult_Completed with allocationCid = toInterfaceContractId allocationCid
+    authorizerChangeCids = TextMap.fromList [(rules.instrumentId.id, changeCids)]
+    meta = emptyMetadata
+
+-- | A mint account only sends and a burn account only receives
+-- (`[CIP112]:622-625`); a regular account may do both.
+sideAllowed : Account -> TransferSide -> Bool
+sideAllowed authorizer side
+  | authorizer == mintAccount = side == SenderSide
+  | authorizer == burnAccount = side == ReceiverSide
+  | otherwise = True
+
+-- | `TransferFactory_Transfer` (`TransferInstructionV2.daml:228-251`).
+transferImpl : ShareRules -> TransferFactory_Transfer -> Update TransferInstructionResult
+transferImpl rules arg = do
+  let admin = rules.admin
+      transfer = arg.transfer
+  require registryWrongAdmin (transfer.instrumentId.admin == admin)
+  require registryWrongInstrument (transfer.instrumentId == rules.instrumentId)
+  validateAccount admin False transfer.sender
+  validateAccount admin False transfer.receiver
+  let senderOwner = fromSome transfer.sender.owner
+      receiverOwner = fromSome transfer.receiver.owner
+      oneStep = receiverOwner `elem` arg.actors
+      allowed = dedupSort (accountParties admin transfer.sender ++ accountParties admin transfer.receiver)
+  require registryUnauthorizedActors
+    (senderOwner `elem` arg.actors && all (`elem` allowed) arg.actors)
+  require registryFieldTooLarge (boundedTransfer transfer)
+  require registryInvalidAmount (transfer.amount > 0.0)
+  notYet <- isLedgerTimeLT transfer.requestedAt
+  require registryNotYetRequested (not notYet)
+  open <- isLedgerTimeLT transfer.executeBefore
+  require registryDeadlinePassed open
+  inputs <- validateInputHoldings transfer.instrumentId transfer.sender transfer.inputHoldingCids
+  let total = sum (map (\(_, holding) -> holding.amount) inputs)
+      inputCids = map fst inputs
+  require registryInsufficientFunds (total >= transfer.amount)
+  forA_ inputCids archive
+  change <- if total > transfer.amount
+    then (:: []) <$> createHolding admin transfer.instrumentId transfer.sender (total - transfer.amount)
+    else pure []
+  if oneStep
+    then do
+      received <- createHolding admin transfer.instrumentId transfer.receiver transfer.amount
+      logTransfer admin transfer inputCids change [received]
+      pure TransferInstructionResult with
+        output = TransferInstructionResult_Completed with receiverHoldingCids = [toInterfaceContractId received]
+        senderChangeCids = map toInterfaceContractId change
+        meta = emptyMetadata
+    else do
+      locked <- createLockedHolding admin transfer.instrumentId transfer.sender transfer.amount
+        "transfer" (accountParties admin transfer.receiver)
+      logMergeSplit admin transfer.sender inputCids "instruct transfer" (locked :: change)
+      instructionCid <- create ShareTransferInstruction with
+        admin
+        transfer = transfer with inputHoldingCids = map toInterfaceContractId inputCids
+        lockedHoldingCid = locked
+      pure TransferInstructionResult with
+        output = TransferInstructionResult_Pending with transferInstructionCid = toInterfaceContractId instructionCid
+        senderChangeCids = map toInterfaceContractId change
+        meta = emptyMetadata

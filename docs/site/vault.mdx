@@ -1,0 +1,142 @@
+---
+title: Vault
+description: A Daml vault that holds a CIP-0112 asset and issues shares against it, with exact conversion math, batched execution and a share registry on the Canton Token Standard V2.
+---
+
+A vault holds an underlying token and issues shares against it. Depositors send the underlying and receive shares; redeemers burn shares and receive underlying, at the vault's price. The price is `totalAssets / totalShares`, with virtual shares and a decimals offset against the first-deposit attack, and every conversion rounds in the vault's favour.
+
+<Callout type="warn">
+Pre-release and unaudited. Depositors trust the vault's operator with custody. The packages use the Canton Token Standard V2 interfaces of Splice 0.8.4, and CIP-0112, which defines minting and burning through special accounts, is Approved, not Final.
+</Callout>
+
+## Packages
+
+| Package | Kind | Public modules | Use |
+|---|---|---|---|
+| `cvx-vault-math-v1` | Utility | `Cayvox.VaultMathV1` | `mulDiv`: exact `a * b / c` with the rounding direction chosen by the caller |
+| `cvx-api-vault-v1` | Frozen API | `Cayvox.Api.VaultV1` | The `Vault` interface and its `VaultView`, for wallets and indexers |
+| `cvx-vault-v1` | Implementation | `Cayvox.VaultV1`, `Cayvox.VaultV1.Conversion` | The vault, its requests, its conversion functions and its share registry |
+
+Modules under `.Internal` are not public API.
+
+## Requests, Batches and Settlement
+
+A vault does not move tokens when a requester asks. The requester creates a request, an offer with an amount, a minimum output and a deadline, signed by the requester alone. An execution then settles one batch of 1 to 25 requests of one kind in a single transaction:
+
+1. The vault checks every request in batch order on the running state: the vault it names, the deadline, any funding allocation, the bounds, the output, the requester's minimum.
+2. It creates every allocation: the requester's, through a delegation choice on the request, and its own.
+3. It settles every leg at both registries: the requester's input moves to the vault account (deposit) or to `cip-112/burn` (redemption), and the output moves to the requester's receiver account, minted from `cip-112/mint` or paid from the vault account.
+
+`totalAssets` and `totalShares` change in the same transaction. A failure anywhere changes nothing.
+
+Who executes is fixed per vault:
+
+- **Permissioned:** the operator executes every request.
+- **Permissionless:** a requester executes its own requests, with the vault state, the share registry's rules and, for a redemption, the vault holdings that pay it disclosed by the operator, and the underlying registry's factory disclosed by that registry. The operator can still execute anyone's requests, and its participant confirms every execution.
+
+The requester's side, creating, funding and cancelling a request, and what each submitter must be handed, is in the specification's sections on actors and requests (`docs/SPEC.md` §2, §5.2).
+
+## Usage
+
+The operator creates the share registry's `ShareRules` and the `VaultState`, both exported by `Cayvox.VaultV1`.
+
+```daml
+import Splice.Api.Token.HoldingV2 (Holding)
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Cayvox.VaultV1
+
+-- The operator executes one deposit request in Permissioned mode.
+deposit : ContractId VaultState -> Party -> ContractId DepositRequest -> [ContractId Holding] -> ExtraArgs -> ExtraArgs -> Update ExecResult
+deposit vault operator request inputs assetContext shareContext =
+  exercise vault Vault_ExecuteDeposits with
+    executor = operator
+    items = [DepositItem with request; fundingAllocation = None; fundingInputs = inputs]
+    assetContext; shareContext
+```
+
+A redemption batch names the vault-account holdings that pay each redemption. Each redemption spends its named holdings and then the change the previous redemption returned, so one holding that covers the batch can be named once, by the first redemption.
+
+## Functions
+
+`Cayvox.VaultV1.Conversion` takes a `VaultView` and an amount. With `VA = 0.0000000001` and `VS = 10^k * 0.0000000001`, each result is exact and rounded once:
+
+| Function | Result | Rounding |
+|---|---|---|
+| `convertToShares`, `previewDeposit` | `assets * (S + VS) / (A + VA)` | down |
+| `convertToAssets`, `previewRedeem` | `shares * (A + VA) / (S + VS)` | down |
+| `previewMint` | `shares * (A + VA) / (S + VS)` | up |
+| `previewWithdraw` | `assets * (S + VS) / (A + VA)` | up |
+
+`Cayvox.VaultMathV1.mulDiv r a b c` computes on the exact integers behind its operands, so `a * b` never rounds or overflows on its own; only the result must fit in a `Decimal`.
+
+## Failure Statuses
+
+Every failure the vault raises is a `FailureStatus` with category `InvalidGivenCurrentSystemStateOther`; a create that breaks an `ensure` fails with `PreconditionFailed`, and the participant and the registries raise their own errors. Match on `errorId`, never on the message.
+
+| `errorId` | Condition |
+|---|---|
+| `cayvox.com/vault-unauthorized-executor` | Permissioned: the executor is not the operator. Permissionless: a request is not the executor's own |
+| `cayvox.com/vault-paused` | A deposit or an asset addition while paused |
+| `cayvox.com/vault-batch-size`, `cayvox.com/vault-duplicate-request` | A batch outside 1 to 25 requests, or a request listed twice |
+| `cayvox.com/vault-wrong-vault`, `cayvox.com/vault-request-expired` | A request of another vault, or at or after its deadline |
+| `cayvox.com/vault-allocation-mismatch` | An allocation not bound to its request, or not of the registry's own template; an asset addition whose source is the vault account |
+| `cayvox.com/vault-capacity-exceeded` | `A` or `S` would leave the vault's bounds |
+| `cayvox.com/vault-zero-shares`, `cayvox.com/vault-zero-assets` | The output rounds to zero |
+| `cayvox.com/vault-slippage` | The output is below the requester's minimum |
+| `cayvox.com/vault-insufficient-assets` | A redemption would pay more than `A` |
+| `cayvox.com/vault-no-shares` | An asset addition to a vault with no shares |
+| `cayvox.com/vault-invalid-amount` | A non-positive amount or a negative minimum |
+| `cayvox.com/vault-already-paused`, `cayvox.com/vault-not-paused` | Pausing a paused vault, or unpausing an active one |
+| `cayvox.com/math-negative-operand`, `cayvox.com/math-non-positive-divisor`, `cayvox.com/math-overflow` | `mulDiv` given a negative operand or a non-positive divisor, or a result above the largest `Decimal` |
+
+The share registry's failures carry `cayvox.com/registry-...` identifiers, listed with their conditions in the `cvx-vault-v1` README.
+
+## Reading the Vault Off-Ledger
+
+`VaultState` implements `Vault` of `cvx-api-vault-v1`, whose view carries the vault's identity and accounting: operator, identifier, the underlying and share instruments, `totalAssets`, `totalShares`, the decimals offset, the mode and the pause flag. The vault state has no observers; a reader receives it by explicit disclosure from the operator. Share holdings, allocations and transfers are read through the Token Standard V2 interfaces, and every change to share holdings is explained by a `ShareEventLog` event.
+
+## Pausing
+
+The operator pauses and unpauses the vault. Pausing stops deposits and asset additions; redemptions and cancellations continue, so a pause never blocks a redemption. Exit still depends on the operator: it executes redemptions in Permissioned mode, and discloses and confirms them in Permissionless mode.
+
+## Security Considerations
+
+- Depositors trust the operator with custody: the operator owns the vault account, signs the vault state and administers the share instrument. None of its powers can be prevented on the ledger; each is detectable by reconciling `totalAssets` with the underlying vault choices moved, and `totalShares` with the share holdings. Reconciliation needs the operator's view, because the vault state has no observers: the operator runs the reconciliation tool under `tools/`, or gives an auditor read rights for its party; a depositor without either relies on its trust in the operator.
+- Every request settlement names the operator as its only executor, so the operator can settle a pending request's input alone and pay nothing. A live request is a standing authorization of its amount until it executes, is cancelled with all its allocations withdrawn, or reaches its deadline. A committed funding allocation can be withdrawn only after its deadline, so a funded request stays settleable by the operator until then, even after cancellation. Keep deadlines short.
+- The vault exercises the registry factories recorded in its state with the operator's authority: record only the registries' own factories, and vet only their packages.
+- The executor chooses the order of a batch, and the order affects each request's price; the requester's minimum and deadline bound the effect.
+- After assets are added without minting shares, the price exceeds one, and a deposit below it mints zero shares and fails; the requester's minimum protects it.
+- The deadline applies to the ledger time the submitting participant assigns. Submit an execution at least one second before the earliest deadline of its batch, and keep the synchronizer's ledger time record time tolerance at its default of one minute.
+- A Permissionless execution needs the operator's participant to confirm; when it is down, the execution aborts after the confirmation timeout and changes nothing, and requesters can still cancel.
+- Give each vault its own vault account, and never reuse the identifier of a retired vault: its shares and live requests would act on the new one.
+- The accounting assumes an underlying without transfer or holding fees.
+- When a registry replaces its factory, the operator archives the vault state and creates it again with the new factory and every other field unchanged.
+- In Permissionless mode every execution consumes the vault state, so a requester that keeps executing small requests makes others retry.
+- A funded request's allocation must come from the registry's V2 allocation factory.
+- `Vault_AddAssets` raises the price in one step; add yield in small, frequent steps, once the share supply is well above the smallest unit.
+- The registry implements the V2 interfaces only; V1-only wallets see no share holdings.
+
+## Upgrades
+
+Templates add fields only as `Optional`, under Smart Contract Upgrade. Build `cvx-api-vault-v1` with SDK 3.4.11 only: its package ID is recorded, and another SDK compiles another ID. In Permissionless mode a requester chooses the package version it submits with, so after a security fix the operator unvets the old version. `cvx-api-vault-v1` cannot be upgraded: an interface package is replaced by a new `-v2` package, so every compatible release of the vault keeps depending on `cvx-api-vault-v1` at `0.1.0`.
+
+## Build and Consume
+
+```sh
+DAML_PACKAGE=packages/token/vault-v1 dpm build
+```
+
+```yaml
+data-dependencies:
+  - ../canton-vault/packages/token/vault-v1/.daml/dist/cvx-vault-v1-0.1.0.dar
+```
+
+Daml-LF `2.1`. Tested in memory on SDK 3.4.11, 3.5.8 and 3.5.10, and on Canton sandboxes of SDK 3.4.11 (protocol version 34) and SDK 3.5.10 (protocol version 35).
+
+## Related
+
+- The package READMEs: [`cvx-vault-math-v1`](../../packages/utils/vault-math-v1/README.md), [`cvx-api-vault-v1`](../../packages/token/api-vault-v1/README.md), [`cvx-vault-v1`](../../packages/token/vault-v1/README.md).
+- The [admission example](../../examples/vault-admission-v1/README.md), and `scripts/demo.sh`, which runs it on a sandbox.
+- The [reconciliation tool](../../tools/vault-reconcile/README.md).
+- [CIP-0112](https://github.com/canton-foundation/cips/tree/main/cip-0112) and the Canton Token Standard V2 of Splice 0.8.4.
+- Pausable: the vault keeps a local `paused` flag with the semantics of OpenZeppelin's Pausable; the `Pausable` interface instance can be added to `VaultState` later under Smart Contract Upgrade (`docs/DECISIONS.md`, D-14).

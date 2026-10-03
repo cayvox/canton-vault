@@ -1,0 +1,364 @@
+-- | Share registry tests: events (`docs/REGISTRY-MUSTS.md`, section 6) and
+-- the threats T-06, T-12 and T-13 (section 10).
+module Cayvox.VaultV1Test.EventsAndThreats where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (sort)
+import DA.Optional (isSome)
+import DA.Time (addRelTime, seconds)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferEventsV2 as Events
+import Splice.Api.Token.TransferInstructionV2
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard
+import Cayvox.VaultV1Test.Hostile
+import Cayvox.VaultV1Test.Setup
+
+-- Tree submissions
+-------------------
+
+-- | Submit and return the transaction tree, with the rules disclosed.
+treeOf : Registry -> [Party] -> Commands a -> Script TransactionTree
+treeOf reg actors cmds = do
+  d <- rulesDisclosure reg
+  submitTree (actAs actors <> disclose d) cmds
+
+allocateCmd : Registry -> [Party] -> SettlementInfo -> AllocationSpecification -> [ContractId Holding] -> Time -> Commands AllocationInstructionResult
+allocateCmd reg actors settlement allocation inputs now =
+  exerciseCmd (toInterfaceContractId @AllocationFactory reg.rules) AllocationFactory_Allocate with
+    settlement; allocation; requestedAt = now; inputHoldingCids = inputs; extraArgs = noArgs; actors
+
+settleCmd : Registry -> SettlementInfo -> [TransferLeg] -> [ContractId Allocation] -> Commands SettlementFactory_SettleBatchResult
+settleCmd reg settlement legs allocations =
+  exerciseCmd (toInterfaceContractId @SettlementFactory reg.rules) SettlementFactory_SettleBatch with
+    settlement; transferLegs = legs; allocations = map nonIteratedAllocation allocations
+    actors = [reg.operator]; extraArgs = noArgs
+
+transferCmd : Registry -> [Party] -> Account -> Account -> Decimal -> [ContractId Holding] -> Time -> Commands TransferInstructionResult
+transferCmd reg actors sender receiver amount inputs now =
+  exerciseCmd (toInterfaceContractId @TransferFactory reg.rules) TransferFactory_Transfer with
+    transfer = Transfer with
+      sender; receiver; amount; instrumentId = reg.instrument; requestedAt = now
+      executeBefore = addRelTime now (seconds 60); inputHoldingCids = inputs; meta = emptyMetadata
+    actors; extraArgs = noArgs
+
+-- | The net change in shares each event reports for its account: receipts
+-- minus sends.
+legNet : Events.EventLog_HoldingsChange -> Decimal
+legNet e = sum [ if l.side == Events.ReceiverSide then l.amount else negate l.amount | l <- e.transferLegSides ]
+
+-- | Every event of the tree explains the holdings; each account's reported
+-- net change equals its change in balance (RM-44 to RM-47).
+checkTree : Registry -> [Party] -> Script () -> Script TransactionTree -> Script ()
+checkTree reg owners before action = do
+  before
+  balances0 <- forA owners (balanceOf reg)
+  tree <- action
+  facts <- assertEventsExplain reg tree
+  check "no event was found in the transaction" (not (null facts.events))
+  check "no holding change was found in the transaction" (not (null facts.created && null facts.archived))
+  balances1 <- forA owners (balanceOf reg)
+  forA_ (zip3 owners balances0 balances1) $ \(p, (u0, l0), (u1, l1)) -> do
+    let reported = sum [ legNet e | e <- facts.events, e.account.owner == Some p ]
+    check ("net change of " <> show p <> " does not match its events") (reported == (u1 + l1) - (u0 + l0))
+
+-- | Every operation that changes share holdings reports exactly one event
+-- per holding created or archived, for its account (RM-44, RM-45, RM-46,
+-- RM-47).
+test_events_explainEveryHoldingChange : Script ()
+test_events_explainEveryHoldingChange = do
+  reg <- setupRegistry "events"
+  alice <- allocateParty "alice-events"
+  bob <- allocateParty "bob-events"
+  let owners = [alice, bob]
+      aliceA = basicAccount alice
+      bobA = basicAccount bob
+      nothing = pure ()
+  now <- getTime
+  -- a mint settlement
+  let mintS = settlementOf reg "mint"
+      mintL = shareLeg reg "m" mintAccount aliceA 10.0
+  (m, _) <- allocate reg [reg.operator] mintS (specOf reg mintAccount [senderSide mintL] None False) []
+  (r, _) <- allocate reg [alice] mintS (specOf reg aliceA [receiverSide mintL] None False) []
+  checkTree reg owners nothing (treeOf reg [reg.operator] (settleCmd reg mintS [mintL] [m, r]))
+  -- a funded allocation with change
+  h <- largestUnlocked reg alice
+  let s = settlementOf reg "s"
+      l = shareLeg reg "l" aliceA bobA 4.0
+  allocTree <- treeOf reg [alice] (allocateCmd reg [alice] s (specOf reg aliceA [senderSide l] None False) [h] now)
+  allocFacts <- assertEventsExplain reg allocTree
+  length allocFacts.events === 1
+  (length allocFacts.created, length allocFacts.archived) === (2, 1)
+  [send] <- map fst <$> queryInterface @Allocation alice
+  (recv, _) <- allocate reg [bob] s (specOf reg bobA [receiverSide l] None False) []
+  -- a settlement between two regular accounts
+  checkTree reg owners nothing (treeOf reg [reg.operator] (settleCmd reg s [l] [send, recv]))
+  -- a cancellation and a withdrawal of funded allocations
+  h2 <- largestUnlocked reg alice
+  (c1, _) <- allocate reg [alice] (settlementOf reg "c") (specOf reg aliceA [senderSide l with amount = 1.0] None False) [h2]
+  checkTree reg owners nothing (treeOf reg [reg.operator] (exerciseCmd c1 Allocation_Cancel with actors = [reg.operator]; extraArgs = noArgs))
+  h3 <- largestUnlocked reg alice
+  (w1, _) <- allocate reg [alice] (settlementOf reg "w") (specOf reg aliceA [senderSide l with amount = 1.0] None False) [h3]
+  checkTree reg owners nothing (treeOf reg [alice] (exerciseCmd w1 Allocation_Withdraw with actors = [alice]; extraArgs = noArgs))
+  -- a one-step transfer and a pending one accepted, rejected and withdrawn
+  h4 <- largestUnlocked reg alice
+  checkTree reg owners nothing (treeOf reg [alice, bob] (transferCmd reg [alice, bob] aliceA bobA 1.0 [h4] now))
+  let pendingTransfer = do
+        hx <- largestUnlocked reg alice
+        tree <- treeOf reg [alice] (transferCmd reg [alice] aliceA bobA 0.5 [hx] now)
+        _ <- assertEventsExplain reg tree
+        [(i, _)] <- queryInterface @TransferInstruction bob
+        pure i
+  i1 <- pendingTransfer
+  checkTree reg owners nothing (treeOf reg [bob] (exerciseCmd i1 TransferInstruction_Accept with actors = [bob]; extraArgs = noArgs))
+  i2 <- pendingTransfer
+  checkTree reg owners nothing (treeOf reg [bob] (exerciseCmd i2 TransferInstruction_Reject with actors = [bob]; extraArgs = noArgs))
+  i3 <- pendingTransfer
+  checkTree reg owners nothing (treeOf reg [alice] (exerciseCmd i3 TransferInstruction_Withdraw with actors = [alice]; extraArgs = noArgs))
+  -- a burn settlement
+  h5 <- largestUnlocked reg bob
+  let burnS = settlementOf reg "burn"
+      burnL = shareLeg reg "b" bobA burnAccount 1.0
+  (bs, _) <- allocate reg [bob] burnS (specOf reg bobA [senderSide burnL] None False) [h5]
+  (bb, _) <- allocate reg [reg.operator] burnS (specOf reg burnAccount [receiverSide burnL] None False) []
+  checkTree reg owners nothing (treeOf reg [reg.operator] (settleCmd reg burnS [burnL] [bs, bb]))
+
+-- | Both sides of a transfer are reported with one leg identifier, and the
+-- sides' amounts match (RM-46).
+test_events_netChangesMatchHoldings : Script ()
+test_events_netChangesMatchHoldings = do
+  reg <- setupRegistry "net"
+  alice <- allocateParty "alice-net"
+  bob <- allocateParty "bob-net"
+  h <- mintShares reg alice 10.0 "net"
+  now <- getTime
+  tree <- treeOf reg [alice, bob] (transferCmd reg [alice, bob] (basicAccount alice) (basicAccount bob) 3.0 [h] now)
+  facts <- assertEventsExplain reg tree
+  let legs = concatMap (.transferLegSides) facts.events
+  sort (map (\l -> (l.side, l.amount)) legs) === sort [(Events.SenderSide, 3.0), (Events.ReceiverSide, 3.0)]
+  check "leg identifiers of one transfer differ" (all (\l -> l.transferLegId == "") legs)
+
+-- | A provider sees its account's holdings, allocations and events (RM-03,
+-- RM-47).
+test_provider_seesHoldingsAllocationsAndEvents : Script ()
+test_provider_seesHoldingsAllocationsAndEvents = do
+  reg <- setupRegistry "provider"
+  alice <- allocateParty "alice-provider"
+  prov <- allocateParty "provider-provider"
+  bob <- allocateParty "bob-provider"
+  let acct = Account with owner = Some alice; provider = Some prov; id = ""
+      s = settlementOf reg "mint"
+      l = shareLeg reg "m" mintAccount acct 10.0
+  (m, _) <- allocate reg [reg.operator] s (specOf reg mintAccount [senderSide l] None False) []
+  (r, _) <- allocate reg [alice] s (specOf reg acct [receiverSide l] None False) []
+  seen <- queryInterfaceContractId prov r
+  check "the provider does not see the allocation" (isSome seen)
+  tree <- treeOf reg [reg.operator] (settleCmd reg s [l] [m, r])
+  facts <- assertEventsExplain reg tree
+  check "the provider is not an event observer" (all (\e -> prov `elem` e.observers) facts.events)
+  held <- query @ShareHolding prov
+  length held === 1
+
+-- T-12: events only from registry operations
+----------------------------------------------
+
+-- | The operator cannot create an event log for an account on its own
+-- (RM-48).
+test_eventLog_operatorAloneCannotCreate : Script ()
+test_eventLog_operatorAloneCannotCreate = do
+  reg <- setupRegistry "log-alone"
+  alice <- allocateParty "alice-log-alone"
+  trySubmit reg.operator (createCmd ShareEventLog with admin = reg.operator; account = basicAccount alice)
+    >>= assertFails Authorization
+  trySubmit reg.operator (createCmd ShareEventLog with admin = reg.operator; account = basicAccount reg.operator)
+    >>= assertFails PreconditionViolated
+  mallory <- allocateParty "mallory-log-alone"
+  spoofer <- submit mallory $ createCmd EventSpoofer with mallory; operator = reg.operator; victim = basicAccount alice
+  trySubmit mallory (exerciseCmd spoofer EventSpoofer_Spoof) >>= assertFails Authorization
+
+-- | After every registry operation no event log remains active (RM-48).
+test_eventLog_noneRemainsActive : Script ()
+test_eventLog_noneRemainsActive = do
+  reg <- setupRegistry "log-none"
+  alice <- allocateParty "alice-log-none"
+  bob <- allocateParty "bob-log-none"
+  h <- mintShares reg alice 10.0 "log-none"
+  _ <- tryTransfer reg [alice, bob] (basicAccount alice) (basicAccount bob) 3.0 [h] (seconds 60)
+  logs <- query @ShareEventLog reg.operator
+  logs === []
+
+-- | An event log, its account and a submitter of its event.
+eventLogFixture : Text -> Script (Registry, Party, Party, ContractId ShareEventLog)
+eventLogFixture tag = do
+  reg <- setupRegistry tag
+  alice <- allocateParty ("alice-" <> tag)
+  mallory <- allocateParty ("mallory-" <> tag)
+  l <- submit (actAs [reg.operator, alice]) $ createCmd ShareEventLog with admin = reg.operator; account = basicAccount alice
+  pure (reg, alice, mallory, l)
+
+logEvent : Party -> Account -> [Party] -> Events.EventLog_HoldingsChange
+logEvent admin account observers = Events.EventLog_HoldingsChange with
+  admin; account; inputHoldingCids = []; transferLegSides = []; outputHoldingCids = []
+  observers; extraArgs = noArgs
+
+exerciseLog : [Party] -> ContractId ShareEventLog -> Events.EventLog_HoldingsChange
+  -> Script (Either SubmitError Events.EventLog_HoldingsChangeResult)
+exerciseLog actors cid e = trySubmit (actAs actors) $ exerciseCmd (toInterfaceContractId @Events.EventLog cid) e
+
+-- | The log's own event consumes it (T-12).
+test_eventLog_isConsumedByItsEvent : Script ()
+test_eventLog_isConsumedByItsEvent = do
+  (reg, alice, _, l) <- eventLogFixture "log-consumed"
+  _ <- exerciseLog [reg.operator] l (logEvent reg.operator (basicAccount alice) [alice]) >>= either (abort . show) pure
+  assertArchived alice l
+
+-- | An event for another account is rejected.
+test_eventLog_rejectsAnotherAccount : Script ()
+test_eventLog_rejectsAnotherAccount = do
+  (reg, alice, mallory, l) <- eventLogFixture "log-account"
+  exerciseLog [reg.operator] l (logEvent reg.operator (basicAccount mallory) [alice]) >>= assertFails (registry "invalid-account")
+  exerciseLog [reg.operator] l (logEvent reg.operator (basicAccount alice) [alice]) >>= either (abort . show) (const (pure ()))
+
+-- | An event whose observers omit the account parties is rejected (RM-47).
+test_eventLog_rejectsMissingObservers : Script ()
+test_eventLog_rejectsMissingObservers = do
+  (reg, alice, _, l) <- eventLogFixture "log-observers"
+  exerciseLog [reg.operator] l (logEvent reg.operator (basicAccount alice) []) >>= assertFails (registry "unauthorized-actors")
+  exerciseLog [reg.operator] l (logEvent reg.operator (basicAccount alice) [alice]) >>= either (abort . show) (const (pure ()))
+
+-- | An event reported by another admin, through a disclosed log, is
+-- rejected (T-12).
+test_eventLog_rejectsAnotherAdmin : Script ()
+test_eventLog_rejectsAnotherAdmin = do
+  (reg, alice, mallory, l) <- eventLogFixture "log-admin"
+  Some d <- queryDisclosure reg.operator l
+  trySubmit (actAs mallory <> disclose d) (exerciseCmd (toInterfaceContractId @Events.EventLog l) (logEvent mallory (basicAccount alice) [alice]))
+    >>= assertFails (registry "wrong-admin")
+  exerciseLog [reg.operator] l (logEvent reg.operator (basicAccount alice) [alice]) >>= either (abort . show) (const (pure ()))
+
+-- T-13: no shares outside settlement
+-------------------------------------
+
+-- | Neither the operator alone nor a template of another party can create
+-- shares (T-13).
+test_holding_operatorCannotMintToOwner : Script ()
+test_holding_operatorCannotMintToOwner = do
+  reg <- setupRegistry "mint-alone"
+  alice <- allocateParty "alice-mint-alone"
+  mallory <- allocateParty "mallory-mint-alone"
+  trySubmit reg.operator (createCmd ShareHolding with
+    admin = reg.operator; instrumentId = reg.instrument; account = basicAccount alice
+    amount = 1.0; lock = None; lockObservers = []; meta = emptyMetadata)
+    >>= assertFails Authorization
+  minter <- submit mallory $ createCmd ShareMinter with mallory; operator = reg.operator; instrumentId = reg.instrument
+  trySubmit mallory (exerciseCmd minter ShareMinter_Mint) >>= assertFails Authorization
+
+test_holding_operatorCannotMintToItself : Script ()
+test_holding_operatorCannotMintToItself = do
+  reg <- setupRegistry "mint-self"
+  trySubmit reg.operator (createCmd ShareHolding with
+    admin = reg.operator; instrumentId = reg.instrument; account = basicAccount reg.operator
+    amount = 1.0; lock = None; lockObservers = []; meta = emptyMetadata)
+    >>= assertFails PreconditionViolated
+
+-- | Hostile fixture: the operator tries to create, on its own authority, an
+-- allocation for `cip-112/mint` that receives Alice's shares (the factory
+-- refuses that side, `sideAllowed`). The allocation's `ensure` refuses it,
+-- so no settlement can meet it, and Alice keeps her shares.
+test_settle_specialAccountNeverReceivesShares : Script ()
+test_settle_specialAccountNeverReceivesShares = do
+  reg <- setupRegistry "special-receiver"
+  alice <- allocateParty "alice-special-receiver"
+  h <- mintShares reg alice 10.0 "special-receiver"
+  now <- getTime
+  let s = settlementOf reg "s"
+      leg = shareLeg reg "l" (basicAccount alice) mintAccount 4.0
+  (send, _) <- allocate reg [alice] s (specOf reg (basicAccount alice) [senderSide leg] None False) [h]
+  trySubmit reg.operator (createCmd ShareAllocation with
+    admin = reg.operator; instrumentId = reg.instrument; settlement = s
+    allocation = specOf reg mintAccount [receiverSide leg] None False
+    lockedHoldingCid = None; createdAt = now)
+    >>= assertFails PreconditionViolated
+  trySettle reg s [leg] [send] >>= assertFails (registry "missing-authorization")
+  balanceOf reg alice >>= (=== (6.0, 4.0))
+
+-- | Run an action and require the total supply of the owners unchanged.
+sameSupply : Registry -> [Party] -> Script a -> Script ()
+sameSupply reg owners action = do
+  before <- supplyOf reg owners
+  _ <- action
+  after <- supplyOf reg owners
+  before === after
+
+-- | Only a mint or a burn settlement changes the total supply (T-13).
+test_registry_onlySettlementChangesSupply : Script ()
+test_registry_onlySettlementChangesSupply = do
+  reg <- setupRegistry "supply"
+  alice <- allocateParty "alice-supply"
+  bob <- allocateParty "bob-supply"
+  let owners = [alice, bob]
+      aliceA = basicAccount alice
+      bobA = basicAccount bob
+      same : Script a -> Script ()
+      same = sameSupply reg owners
+  h <- mintShares reg alice 10.0 "supply"
+  supplyOf reg owners >>= (=== 10.0)
+  let s = settlementOf reg "s"
+      l = shareLeg reg "l" aliceA bobA 4.0
+  same (allocate reg [alice] s (specOf reg aliceA [senderSide l] None False) [h])
+  [send] <- map fst <$> queryInterface @Allocation alice
+  (recv, _) <- allocate reg [bob] s (specOf reg bobA [receiverSide l] None False) []
+  same (settle reg s [l] [send, recv])
+  hb <- largestUnlocked reg bob
+  same (tryTransfer reg [bob] bobA aliceA 1.0 [hb] (seconds 60))
+  [(i, _)] <- queryInterface @TransferInstruction alice
+  same (submit alice $ exerciseCmd i TransferInstruction_Accept with actors = [alice]; extraArgs = noArgs)
+  supplyOf reg owners >>= (=== 10.0)
+
+-- T-06: caller-supplied contracts
+-----------------------------------
+
+-- | A forged allocation of another template is never settled: the typed
+-- fetch rejects it before its settle choice could run with the operator's
+-- authority (T-06).
+test_settleBatch_rejectsForgedAllocation : Script ()
+test_settleBatch_rejectsForgedAllocation = do
+  reg <- setupRegistry "forged"
+  mallory <- allocateParty "mallory-forged"
+  bob <- allocateParty "bob-forged"
+  now <- getTime
+  let s = settlementOf reg "s"
+      l = shareLeg reg "l" mintAccount (basicAccount mallory) 1000000.0
+      forgedView = AllocationView with
+        originalAllocationCid = None; settlement = s
+        allocation = specOf reg (basicAccount mallory) [receiverSide l] None False
+        holdingCids = []; createdAt = now; numIterations = 0; expiresAt = None
+        availableActions = noActions; meta = emptyMetadata
+  forged <- submit mallory $ createCmd ForgedAllocation with mallory; operator = reg.operator; instrument = reg.instrument; forgedView
+  (m, _) <- allocate reg [reg.operator] s (specOf reg mintAccount [senderSide l] None False) []
+  let forgedAllocation = toInterfaceContractId @Allocation forged
+  res <- trySettle reg s [l] [m, forgedAllocation]
+  assertFails (WrongTemplate (show forged)) res
+  held <- query @ShareHolding mallory
+  held === []
+
+-- | A holding of another template is rejected as an input (RM-09, T-06).
+test_transfer_rejectsForeignHolding : Script ()
+test_transfer_rejectsForeignHolding = do
+  reg <- setupRegistry "foreign"
+  alice <- allocateParty "alice-foreign"
+  bob <- allocateParty "bob-foreign"
+  foreign <- submit alice $ createCmd ForeignHolding with
+    owner = alice
+    claimed = HoldingView with
+      account = basicAccount alice; instrumentId = reg.instrument; amount = 100.0; lock = None; meta = emptyMetadata
+  res <- tryTransfer reg [alice, bob] (basicAccount alice) (basicAccount bob) 1.0 [toInterfaceContractId foreign] (seconds 60)
+  assertFails (WrongTemplate (show foreign)) res

@@ -1,0 +1,32 @@
+-- | Runs the six conversion functions on vectors given as JSON
+-- (`dpm script --input-file`) for the differential oracle,
+-- `scripts/math-oracle.py check-conversion`.
+module Cayvox.VaultV1Test.ConversionVectors
+  ( ConversionVector (..)
+  , runConversionVectors
+  ) where
+
+import DA.Optional (fromSomeNote)
+import qualified DA.Text as T
+import Daml.Script
+
+import Cayvox.VaultV1Test.Conversion (allFns, apply, viewAt)
+
+-- | A view (offset, assets, shares) and an amount, as `Decimal` text.
+data ConversionVector = ConversionVector with
+    k : Int
+    a : Text
+    s : Text
+    x : Text
+  deriving (Eq, Show)
+
+-- | Per vector, the six results joined by `|`, in the order of `allFns`,
+-- each a value or the `errorId` caught with `tryFailureStatus`.
+runConversionVectors : [ConversionVector] -> Script [Text]
+runConversionVectors vectors = do
+  p <- allocateParty "conversion-oracle"
+  forA vectors $ \v -> do
+    let dec t = fromSomeNote ("not a Decimal: " <> t) (T.parseDecimal t)
+        view = viewAt p v.k (dec v.a) (dec v.s)
+    results <- forA allFns $ \fn -> tryFailureStatus (let r = apply fn view (dec v.x) in pure r)
+    pure (T.intercalate "|" (map (either (.errorId) show) results))

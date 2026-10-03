@@ -1,0 +1,337 @@
+-- | The token-standard functions the share registry needs, twenty in
+-- all, implemented from the V2 specification at Splice `0.8.4`
+-- (`token-standard/splice-api-token-*-v2`) with no dependency on
+-- `splice-token-standard-utils` (D-07). The test package compares each with
+-- its utils counterpart (`test/vault-v1-test`, `Cayvox.VaultV1Test.Differential`).
+--
+-- Failures use this package's identifiers (`Failure.daml`) instead of the
+-- utils messages. Where a function differs from its utils counterpart beyond
+-- that, its documentation says how and why.
+module Cayvox.VaultV1.Internal.TokenStandard
+  ( -- * Accounts
+    accountPrincipal
+  , accountParties
+  , basicAccount
+  , mintAccount
+  , burnAccount
+    -- * Transfer legs
+  , senderSide
+  , receiverSide
+  , transferLegSidesWithAuthorizer
+  , nonIteratedAllocation
+  , netAllocationCreditAmounts
+    -- * Checks
+  , checkActors
+  , validateNextIterationArgs
+  , ensureWithdrawIsAllowed
+  , fetchAndValidateAllocations
+    -- * Choice implementations
+  , settleBatch
+  , settleBatchExtraObservers
+  , publicFetch
+  , withdrawAllocation
+  , cancelAllocation
+    -- * Events
+  , holdingsChangeIsLogged
+  , logHoldingsChange
+  , allocationSettlementEvent
+  , logAllocationSettlement
+  , toEventLegSide
+  , reasonMeta
+  , emptyExtraArgs
+  ) where
+
+import DA.Foldable (forA_)
+import DA.Optional (fromOptional, isNone, isSome)
+import qualified DA.Set as Set
+import qualified DA.TextMap as TextMap
+import DA.Time (isLedgerTimeGT)
+
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2 (Account (..), Holding)
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferEventsV2 as Events
+
+import Cayvox.VaultV1.Internal.Failure
+
+-- Accounts
+-----------
+
+-- | The principal of an account: its owner, or the admin for a special
+-- account, whose owner is `None` (`HoldingV2.daml:28-33`).
+accountPrincipal : Party -> Account -> Party
+accountPrincipal admin account = fromOptional admin account.owner
+
+-- | The principal and, when set and different, the provider.
+accountParties : Party -> Account -> [Party]
+accountParties admin account = case account.provider of
+    Some provider | provider /= principal -> [principal, provider]
+    _ -> [principal]
+  where
+    principal = accountPrincipal admin account
+
+-- | The basic account of an owner: no provider, identifier `""`
+-- (`HoldingV2.daml:44`).
+basicAccount : Party -> Account
+basicAccount owner = Account with owner = Some owner; provider = None; id = ""
+
+-- | The special account from which a mint is sent (`[CIP112]:622-625`).
+mintAccount : Account
+mintAccount = Account with owner = None; provider = None; id = "cip-112/mint"
+
+-- | The special account to which a burn is sent (`[CIP112]:622-625`).
+burnAccount : Account
+burnAccount = Account with owner = None; provider = None; id = "cip-112/burn"
+
+-- Transfer legs
+----------------
+
+-- | The sender side of a leg: the sender authorizes it, the receiver is the
+-- other side (`AllocationV2.daml:81-96`).
+senderSide : TransferLeg -> TransferLegSide
+senderSide leg = TransferLegSide with
+  transferLegId = leg.transferLegId
+  side = SenderSide
+  otherside = leg.receiver
+  amount = leg.amount
+  instrumentId = leg.instrumentId
+  meta = leg.meta
+
+-- | The receiver side of a leg.
+receiverSide : TransferLeg -> TransferLegSide
+receiverSide leg = TransferLegSide with
+  transferLegId = leg.transferLegId
+  side = ReceiverSide
+  otherside = leg.sender
+  amount = leg.amount
+  instrumentId = leg.instrumentId
+  meta = leg.meta
+
+-- | Both sides of a leg, each with the account that must authorize it.
+transferLegSidesWithAuthorizer : TransferLeg -> [(Account, TransferLegSide)]
+transferLegSidesWithAuthorizer leg = [(leg.sender, senderSide leg), (leg.receiver, receiverSide leg)]
+
+-- | An allocation finalized for a settlement without iteration: no extra leg
+-- sides and no funding for a next iteration (`AllocationV2.daml:206-218`).
+nonIteratedAllocation : ContractId Allocation -> FinalizedAllocation
+nonIteratedAllocation allocationCid = FinalizedAllocation with
+  allocationCid
+  extraTransferLegSides = []
+  nextIterationFunding = None
+
+-- | The net credit per instrument of an authorizer's leg sides: receipts
+-- count positive, sends negative. The sender side of a mint and the receiver
+-- side of a burn count zero, so the admin can authorize mints and burns with
+-- allocations (`AllocationV2.daml:219-222`; `[CIP112]:622-625`).
+netAllocationCreditAmounts : Account -> [TransferLegSide] -> TextMap.TextMap Decimal
+netAllocationCreditAmounts authorizer legs =
+    TextMap.fromListWithR (+) (map legAmount legs)
+  where
+    legAmount leg = (leg.instrumentId, case leg.side of
+      SenderSide
+        | authorizer == mintAccount -> 0.0
+        | otherwise -> negate leg.amount
+      ReceiverSide
+        | authorizer == burnAccount -> 0.0
+        | otherwise -> leg.amount)
+
+-- Checks
+---------
+
+-- | The actors must equal, as a set, one of the allowed groups ("Implementations
+-- MUST check these parties", `AllocationV2.daml:251`, `:296`, `:323`, `:427`).
+checkActors : [Party] -> [[Party]] -> Update ()
+checkActors actors allowed =
+  require registryUnauthorizedActors (any (\group -> Set.fromList actors == Set.fromList group) allowed)
+
+-- | Without iterated settlement, extra leg sides MUST be empty and the next
+-- iteration's funding MUST NOT be set; funding amounts and extra leg amounts
+-- MUST be positive (`AllocationV2.daml:116`, `:213`, `:217`, `:262-268`).
+validateNextIterationArgs : Bool -> [TransferLegSide] -> Optional (TextMap.TextMap Decimal) -> Update ()
+validateNextIterationArgs iterationAllowed extraTransferLegSides nextIterationFunding = do
+  if iterationAllowed then pure ()
+    else require registryIteratedSettlement (null extraTransferLegSides && isNone nextIterationFunding)
+  forA_ nextIterationFunding $ \fundings ->
+    forA_ (TextMap.toList fundings) $ \(_, amount) -> require registryInvalidAmount (amount > 0.0)
+  forA_ extraTransferLegSides $ \leg -> require registryInvalidAmount (leg.amount > 0.0)
+
+-- | A committed allocation can be withdrawn only once its settlement deadline
+-- has passed; one without a deadline never (`AllocationV2.daml:124-135`,
+-- `:310-311`).
+ensureWithdrawIsAllowed : AllocationSpecification -> Update ()
+ensureWithdrawIsAllowed allocation =
+  if not allocation.committed then pure () else case allocation.settlementDeadline of
+    None -> raise registryCommittedAllocation
+    Some deadline -> do
+      passed <- isLedgerTimeGT deadline
+      require registryCommittedAllocation passed
+
+-- | The checks of `SettlementFactory_SettleBatch` (`AllocationV2.daml:398-420`),
+-- reading each allocation with the given function. The share registry passes
+-- a typed fetch of its own allocation template (T-06).
+--
+-- Differences from utils: it also requires at least one transfer leg (the
+-- MUST of `:401`), and it checks the finalized allocation's own
+-- `nextIterationFunding` (the MUST of `:217`) where utils checks the
+-- allocation's. It returns the views unchanged, where utils appends the
+-- finalized allocation's extra leg sides: without iterated settlement
+-- `validateNextIterationArgs` requires them to be empty.
+fetchAndValidateAllocations
+  : Party
+  -> (ContractId Allocation -> Update AllocationView)
+  -> SettlementFactory_SettleBatch
+  -> Update [(FinalizedAllocation, AllocationView)]
+fetchAndValidateAllocations admin fetchView arg = do
+  require registryNoTransferLegs (not (null arg.transferLegs))
+  require registryDuplicateLeg (unique (map (.transferLegId) arg.transferLegs))
+  forA_ arg.transferLegs $ \leg -> require registryInvalidAmount (leg.amount > 0.0)
+  allocations <- forA arg.allocations $ \finalized -> do
+    allocationView <- fetchView finalized.allocationCid
+    let spec = allocationView.allocation
+    require registrySettlementMismatch (allocationView.settlement == arg.settlement)
+    require registryWrongAdmin (spec.admin == admin)
+    validateNextIterationArgs (isSome spec.nextIterationFunding)
+      finalized.extraTransferLegSides finalized.nextIterationFunding
+    pure (finalized, allocationView)
+  let allocated =
+        [ (view.allocation.authorizer, leg) | (_, view) <- allocations, leg <- view.allocation.transferLegSides ]
+  require registryDuplicateLeg
+    (unique [ (authorizer, leg.transferLegId, leg.side) | (authorizer, leg) <- allocated ])
+  let required = Set.fromList (concatMap transferLegSidesWithAuthorizer arg.transferLegs)
+      allocatedSet = Set.fromList allocated
+  require registryMissingAuthorization (Set.null (required `Set.difference` allocatedSet))
+  require registrySuperfluousAuthorization (Set.null (allocatedSet `Set.difference` required))
+  pure allocations
+
+unique : Ord a => [a] -> Bool
+unique xs = Set.size (Set.fromList xs) == length xs
+
+-- Choice implementations
+-------------------------
+
+-- | `SettlementFactory_SettleBatch`: the actors must be the executors, the
+-- allocations are validated, then each is settled with the admin and the
+-- executors as actors, in the order given (`AllocationV2.daml:388-434`,
+-- `:449-451`).
+settleBatch
+  : Party
+  -> (ContractId Allocation -> Update AllocationView)
+  -> (FinalizedAllocation -> Allocation_Settle -> Update AllocationResult)
+  -> SettlementFactory_SettleBatch
+  -> Update SettlementFactory_SettleBatchResult
+settleBatch admin fetchView settleOne arg = do
+  checkActors arg.actors [arg.settlement.executors]
+  allocations <- fetchAndValidateAllocations admin fetchView arg
+  results <- forA allocations $ \(finalized, allocationView) ->
+    settleOne finalized Allocation_Settle with
+      actors = allocationView.allocation.admin :: allocationView.settlement.executors
+      extraTransferLegSides = finalized.extraTransferLegSides
+      nextIterationFunding = finalized.nextIterationFunding
+      extraArgs = arg.extraArgs
+  pure SettlementFactory_SettleBatchResult with
+    allocationSettleResults = results
+    meta = emptyMetadata
+
+-- | No extra observers of a settlement: a private asset shows no settled leg
+-- to the other authorizers (`[CIP112]:1088`).
+settleBatchExtraObservers : SettlementFactory_SettleBatch -> [Party]
+settleBatchExtraObservers _ = []
+
+-- | A `*_PublicFetch` choice returns the view.
+publicFetch : v -> Update v
+publicFetch = pure
+
+-- | `Allocation_Withdraw`, after the allocation is archived: the actors are
+-- the authorizer's principal or provider, alone or together
+-- (`AllocationV2.daml:323-325`); a committed allocation only after its
+-- deadline. `unlock` returns the authorizer's released holdings.
+--
+-- Utils implements this choice only through the V1 `Allocation_Withdraw`
+-- (`allocationV2_withdrawDefaultImplUsingV1`); the registry has no V1
+-- interface (D-07).
+withdrawAllocation
+  : AllocationView -> [Party] -> Update (TextMap.TextMap [ContractId Holding]) -> Update AllocationResult
+withdrawAllocation allocationView actors unlock = do
+  let spec = allocationView.allocation
+  checkActors actors (accountGroups spec.admin spec.authorizer)
+  ensureWithdrawIsAllowed spec
+  authorizerHoldingCids <- unlock
+  pure AllocationResult with
+    output = AllocationResult_Withdrawn
+    authorizerHoldingCids
+    meta = emptyMetadata
+
+-- | `Allocation_Cancel`, after the allocation is archived: the actors are
+-- the executors (`AllocationV2.daml:296-297`). Utils also lets the admin
+-- cancel an expired allocation; the registry's allocations never expire.
+cancelAllocation
+  : AllocationView -> [Party] -> Update (TextMap.TextMap [ContractId Holding]) -> Update AllocationResult
+cancelAllocation allocationView actors unlock = do
+  checkActors actors [allocationView.settlement.executors]
+  authorizerHoldingCids <- unlock
+  pure AllocationResult with
+    output = AllocationResult_Cancelled
+    authorizerHoldingCids
+    meta = emptyMetadata
+
+-- | The groups of an account's parties that may act for it: the principal,
+-- the provider, or both.
+accountGroups : Party -> Account -> [[Party]]
+accountGroups admin account = case accountParties admin account of
+  [principal, provider] -> [[principal], [provider], [principal, provider]]
+  parties -> [parties]
+
+-- Events
+---------
+
+-- | Whether a holdings change is logged: not for an empty change, and not for
+-- a special account, which has no owner to notify.
+holdingsChangeIsLogged : Events.EventLog_HoldingsChange -> Bool
+holdingsChangeIsLogged arg =
+  not ((null arg.transferLegSides && null arg.inputHoldingCids && null arg.outputHoldingCids) || isNone arg.account.owner)
+
+-- | Emit the event with the given function when it is logged.
+logHoldingsChange : (Events.EventLog_HoldingsChange -> Update ()) -> Events.EventLog_HoldingsChange -> Update ()
+logHoldingsChange emit arg = if holdingsChangeIsLogged arg then emit arg else pure ()
+
+-- | The event of a settled allocation: the authorizer's account, its leg
+-- sides, and the holdings consumed and created (`TransferEventsV2.daml:54-106`).
+allocationSettlementEvent
+  : [ContractId Holding] -> AllocationSpecification -> [ContractId Holding] -> Events.EventLog_HoldingsChange
+allocationSettlementEvent inputHoldingCids allocation outputHoldingCids = Events.EventLog_HoldingsChange with
+  admin = allocation.admin
+  account = allocation.authorizer
+  inputHoldingCids
+  transferLegSides = map toEventLegSide allocation.transferLegSides
+  outputHoldingCids
+  observers = accountParties allocation.admin allocation.authorizer
+  extraArgs = ExtraArgs with
+    context = emptyChoiceContext
+    meta = reasonMeta "settle allocation"
+
+-- | Log the event of a settled allocation.
+logAllocationSettlement
+  : (Events.EventLog_HoldingsChange -> Update ())
+  -> [ContractId Holding] -> AllocationSpecification -> [ContractId Holding] -> Update ()
+logAllocationSettlement emit inputHoldingCids allocation outputHoldingCids =
+  logHoldingsChange emit (allocationSettlementEvent inputHoldingCids allocation outputHoldingCids)
+
+-- | An allocation leg side as an event leg side (`TransferEventsV2.daml:10-42`).
+toEventLegSide : TransferLegSide -> Events.TransferLegSide
+toEventLegSide leg = Events.TransferLegSide with
+  transferLegId = leg.transferLegId
+  side = case leg.side of
+    SenderSide -> Events.SenderSide
+    ReceiverSide -> Events.ReceiverSide
+  otherside = leg.otherside
+  amount = leg.amount
+  instrumentId = leg.instrumentId
+  meta = leg.meta
+
+-- | Metadata with the Splice reason key, `splice.lfdecentralizedtrust.org/reason`.
+reasonMeta : Text -> Metadata
+reasonMeta reason = Metadata with values = TextMap.fromList [("splice.lfdecentralizedtrust.org/reason", reason)]
+
+-- | No choice context and no metadata.
+emptyExtraArgs : ExtraArgs
+emptyExtraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata

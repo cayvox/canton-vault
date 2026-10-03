@@ -1,0 +1,564 @@
+-- | One negative test per failure of `docs/SPEC.md` §7, each at its
+-- boundary where it has one: equal, one unit above and one unit below.
+-- Every failure is asserted with the canonical helper.
+module Cayvox.VaultV1Test.VaultErrors where
+
+import DA.Assert ((===))
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import DA.Optional (fromSome)
+import qualified DA.TextMap as TextMap
+import DA.Time (addRelTime, days, microseconds)
+import Daml.Script
+
+import qualified Splice.Api.Token.AllocationInstructionV2 as V2
+import qualified Splice.Api.Token.AllocationV2 as V2A
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount, senderSide)
+import Cayvox.VaultV1.Internal.Vault (Kind (..), allocationSpec, inLeg, outLeg, requestSettlement)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+vaultErr : Text -> Expected
+vaultErr name = Status ("cayvox.com/vault-" <> name) InvalidGivenCurrentSystemStateOther
+
+u : Decimal
+u = 0.0000000001
+
+ok : Either SubmitError a -> Script ()
+ok = either (\e -> abort ("expected success: " <> show e)) (const (pure ()))
+
+-- Executor (step 1)
+--------------------
+
+-- | Permissioned: a non-operator and the requester herself are refused
+-- before any request is read; the operator executes. A party that names
+-- the operator as executor is refused by Canton.
+test_vault_unauthorizedExecutor_permissioned : Script ()
+test_vault_unauthorizedExecutor_permissioned = do
+  w <- setupWorld "exec-perm" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  d <- newDeposit w alice 10.0 0.0 False
+  i <- depositItem w alice d
+  (cid, _) <- vaultOf w
+  vd <- fromSome <$> queryDisclosure w.operator cid
+  let byParty p = trySubmit (actAs p <> disclose vd) $ exerciseCmd cid Vault_ExecuteDeposits with
+        executor = p; items = [i]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+  res <- byParty bob
+  assertFails (vaultErr "unauthorized-executor") res
+  case res of
+    Left err -> check "the helper accepts another identifier" (not (matches (vaultErr "paused") err))
+    Right _ -> abort "expected a failure"
+  byParty alice >>= assertFails (vaultErr "unauthorized-executor")
+  trySubmit (actAs bob <> disclose vd) (exerciseCmd cid Vault_ExecuteDeposits with
+    executor = w.operator; items = [i]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails Authorization
+  tryS (executeDeposits w w.operator [(alice, i)]) >>= ok
+
+-- | Permissionless: a requester executes its own requests only.
+test_vault_unauthorizedExecutor_permissionless : Script ()
+test_vault_unauthorizedExecutor_permissionless = do
+  w <- setupWorld "exec-perl" Permissionless 0 2
+  let [alice, bob] = w.requesters
+  d <- newDeposit w alice 10.0 0.0 False
+  i <- depositItem w alice d
+  rd <- fromSome <$> queryDisclosure alice (fst d)
+  s <- executeDeposits w bob [(alice, i)]
+  attempt (s with disclosures = rd :: s.disclosures) >>= assertFails (vaultErr "unauthorized-executor")
+  tryS (executeDeposits w alice [(alice, i)]) >>= ok
+
+-- Paused (step 2), duplicate (step 4)
+--------------------------------------
+
+test_vault_paused_refusesDeposits : Script ()
+test_vault_paused_refusesDeposits = do
+  w <- setupWorld "paused" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< pause w
+  tryS (depositAll w w.operator [(alice, 10.0, False)]) >>= assertFails (vaultErr "paused")
+
+test_vault_duplicateRequest : Script ()
+test_vault_duplicateRequest = do
+  w <- setupWorld "dup" Permissioned 0 1
+  let [alice] = w.requesters
+  d <- newDeposit w alice 10.0 0.0 False
+  i <- depositItem w alice d
+  tryS (executeDeposits w w.operator [(alice, i), (alice, i)]) >>= assertFails (vaultErr "duplicate-request")
+  tryS (executeDeposits w w.operator [(alice, i)]) >>= ok
+  -- T-03: in a second batch, the executed request is no longer active.
+  (vault, _) <- vaultOf w
+  trySubmit (actAs w.operator) (exerciseCmd vault Vault_ExecuteDeposits with
+    executor = w.operator; items = [i]; assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails (ContractUnavailable (show i.request))
+
+-- Deadline (step 6, T-19)
+--------------------------
+
+-- | One unit before the deadline executes; at and after it, the vault
+-- refuses before any settlement.
+test_vault_requestExpired_atTheDeadline : Script ()
+test_vault_requestExpired_atTheDeadline = do
+  w <- setupWorld "expired" Permissioned 0 3
+  let [a, b, c] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  ds <- forA [a, b, c] $ \p -> do
+    r <- newDepositUntil w p 10.0 0.0 False deadline
+    i <- depositItem w p r
+    pure (p, i)
+  let [da, db, dc] = ds
+  setTime (addRelTime deadline (microseconds (-1)))
+  tryS (executeDeposits w w.operator [da]) >>= ok
+  setTime deadline
+  tryS (executeDeposits w w.operator [db]) >>= assertFails (vaultErr "request-expired")
+  setTime (addRelTime deadline (microseconds 1))
+  tryS (executeDeposits w w.operator [dc]) >>= assertFails (vaultErr "request-expired")
+
+-- Funding allocation (step 7)
+------------------------------
+
+-- | A funded request without its allocation, and an unfunded request with
+-- one, are refused.
+test_vault_allocationMismatch_fundingPresence : Script ()
+test_vault_allocationMismatch_fundingPresence = do
+  w <- setupWorld "presence" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  (fd, Some fa) <- newDeposit w alice 10.0 0.0 True
+  (ud, _) <- newDeposit w bob 10.0 0.0 False
+  inputs <- underlyingHoldings w.underlying bob
+  tryS (executeDeposits w w.operator [(alice, DepositItem with request = fd; fundingAllocation = None; fundingInputs = [])])
+    >>= assertFails (vaultErr "allocation-mismatch")
+  tryS (executeDeposits w w.operator [(bob, DepositItem with request = ud; fundingAllocation = Some fa; fundingInputs = inputs)])
+    >>= assertFails (vaultErr "allocation-mismatch")
+  tryS (executeDeposits w w.operator [(alice, DepositItem with request = fd; fundingAllocation = Some fa; fundingInputs = [])]) >>= ok
+
+-- | A funded allocation that differs from the request in one field is
+-- refused: another request's settlement, one unit more or less, another
+-- deadline, another requester's account.
+test_vault_allocationMismatch_fundingFields : Script ()
+test_vault_allocationMismatch_fundingFields = do
+  w <- setupWorld "fields" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  (req, _) <- newDepositUntil w alice 10.0 0.0 False deadline
+  (other, _) <- newDepositUntil w alice 10.0 0.0 False deadline
+  -- The request's own record, now funded: an allocation of 10.0 bound to it.
+  (_, v) <- vaultOf w
+  let fundWith reqCid amount owner dl = do
+        let account = basicAccount owner
+        inputs <- underlyingHoldings w.underlying owner
+        ud <- underlyingDisclosure w.underlying
+        let leg = inLeg Deposit v.vaultAccount v.asset v.shareInstrument account amount
+        res <- submit (actAs owner <> disclose ud) $
+          exerciseCmd (toInterfaceContractId @V2.AllocationFactory w.underlying.rules) V2.AllocationFactory_Allocate with
+            settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId reqCid)
+            allocation = allocationSpec w.underlying.admin account (senderSide leg) (Some dl) False
+            requestedAt = now; inputHoldingCids = inputs; extraArgs = underlyingArgs w.underlying; actors = [owner]
+        completed res
+  funded <- submit alice $ createCmd DepositRequest with
+    requester = alice; operator = w.operator; vaultId = w.vaultId
+    payAccount = basicAccount alice; receiver = basicAccount alice
+    amount = 10.0; minOut = 0.0; deadline; funded = True; meta = emptyMetadata
+  let item a = DepositItem with request = funded; fundingAllocation = Some a; fundingInputs = []
+      refused a = tryS (executeDeposits w w.operator [(alice, item a)]) >>= assertFails (vaultErr "allocation-mismatch")
+  refused =<< fundWith other 10.0 alice deadline
+  refused =<< fundWith funded (10.0 + u) alice deadline
+  refused =<< fundWith funded (10.0 - u) alice deadline
+  refused =<< fundWith funded 10.0 alice (addRelTime deadline (microseconds 1))
+  refused =<< fundWith funded 10.0 bob deadline
+  good <- fundWith funded 10.0 alice deadline
+  tryS (executeDeposits w w.operator [(alice, item good)]) >>= ok
+  -- Unused request kept: one unrelated request does not disturb another.
+  assertActive alice req
+
+-- Zero outputs (step 10), slippage (step 11)
+---------------------------------------------
+
+-- | k = 0, A = 1000, S = 1 after an asset addition: a deposit of 999u mints
+-- no share and is refused; 1000u and 1001u mint one unit.
+test_vault_zeroShares : Script ()
+test_vault_zeroShares = do
+  w <- setupWorld "zero-shares" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  _ <- run =<< addAssets w 999.0
+  tryS (depositAll w w.operator [(bob, 0.0000000999, False)]) >>= assertFails (vaultErr "zero-shares")
+  res <- run =<< depositAll w w.operator [(bob, 0.0000001, False)]
+  res.outputs === [u]
+  res <- run =<< depositAll w w.operator [(bob, 0.0000001001, False)]
+  res.outputs === [u]
+
+-- | k = 10, A = 1, S = 10^10: a redemption of 0.9999999999 shares pays
+-- nothing and is refused; 1.0 and 1.0000000001 pay one unit.
+test_vault_zeroAssets : Script ()
+test_vault_zeroAssets = do
+  w <- setupWorld "zero-assets" Permissioned 10 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  tryS (redeemAll w w.operator [(alice, 0.9999999999, False)]) >>= assertFails (vaultErr "zero-assets")
+  res <- run =<< redeemAll w w.operator [(alice, 1.0, False)]
+  res.outputs === [u]
+  res <- run =<< redeemAll w w.operator [(alice, 1.0000000001, False)]
+  res.outputs === [u]
+
+-- | `minOut` equal to the output executes; one unit above is refused; one
+-- unit below executes. For deposits and redemptions.
+test_vault_slippage : Script ()
+test_vault_slippage = do
+  w <- setupWorld "slippage" Permissioned 0 1
+  let [alice] = w.requesters
+      deposit minOut = do
+        r <- newDeposit w alice 10.0 minOut False
+        i <- depositItem w alice r
+        tryS (executeDeposits w w.operator [(alice, i)])
+      redeem minOut = do
+        r <- newRedeem w alice 1.0 minOut False
+        i <- redeemItem w alice r
+        tryS (executeRedeems w w.operator [(alice, i)])
+  deposit (10.0 + u) >>= assertFails (vaultErr "slippage")
+  deposit 10.0 >>= ok
+  deposit (10.0 - u) >>= ok
+  redeem (1.0 + u) >>= assertFails (vaultErr "slippage")
+  redeem 1.0 >>= ok
+  redeem (1.0 - u) >>= ok
+
+-- Capacity (steps 8 and 12, `docs/SPEC.md` §5.5)
+-------------------------------------------------
+
+-- | At k = 0 and 10, the largest deposit within the asset bound executes and
+-- one unit more is refused; the same for an asset addition.
+test_vault_capacityExceeded : Script ()
+test_vault_capacityExceeded = forA_ [(0, 9999999999999999999999999999.9999999998), (10, 999999999999999999.9999999998)] $ \(k, room) -> do
+  w <- setupWorldWith ("capacity-" <> show k) Permissioned k 2 room
+  let [alice, bob] = w.requesters
+  mintUnderlying w.underlying alice u
+  tryS (depositAll w w.operator [(alice, room + u, False)]) >>= assertFails (vaultErr "capacity-exceeded")
+  _ <- run =<< depositAll w w.operator [(alice, room - u, False)]
+  tryS (depositAll w w.operator [(bob, u + u, False)]) >>= assertFails (vaultErr "capacity-exceeded")
+  _ <- run =<< depositAll w w.operator [(bob, u, False)]
+  tryS (addAssets w u) >>= assertFails (vaultErr "capacity-exceeded")
+  (a, _) <- totalsOf w
+  a === room
+
+-- | Asset additions at the bound: one unit within executes, one more is refused.
+test_vault_capacityExceeded_addAssets : Script ()
+test_vault_capacityExceeded_addAssets = do
+  let room = 999999999999999999.9999999998
+  w <- setupWorldWith "capacity-add" Permissioned 10 1 room
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  -- The refused addition's allocation keeps its funds locked; the sponsor
+  -- gets a second amount for the accepted one.
+  mintUnderlying w.underlying w.sponsor room
+  tryS (addAssets w (room - 1.0 + u)) >>= assertFails (vaultErr "capacity-exceeded")
+  _ <- run =<< addAssets w (room - 1.0)
+  totalsOf w >>= (=== (room, 10000000000.0))
+
+-- Insufficient assets (step 12 of a redemption)
+------------------------------------------------
+
+-- | Shares minted outside the vault (T-13) let a requester redeem more
+-- than the vault's supply: a redemption paying exactly `A` executes, one
+-- paying one unit more is refused.
+test_vault_insufficientAssets : Script ()
+test_vault_insufficientAssets = do
+  w <- setupWorld "insufficient" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 100.0, False)]
+  _ <- S.mintShares w.shares alice 1000.0 "outside"
+  tryS (redeemAll w w.operator [(alice, 100.0 + u, False)]) >>= assertFails (vaultErr "insufficient-assets")
+  res <- run =<< redeemAll w w.operator [(alice, 100.0, False)]
+  res.outputs === [100.0]
+
+-- | At `k = 10` an amount just above `S`, held
+-- through shares minted outside the vault, passes `assets <= A`; the vault
+-- refuses it with its own identifier rather than at the successor's
+-- `ensure` (`docs/SPEC.md` §5.4).
+test_vault_insufficientAssets_amountAboveSupply : Script ()
+test_vault_insufficientAssets_amountAboveSupply = do
+  w <- setupWorld "above-supply" Permissioned 10 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 1.0, False)]
+  (_, v) <- vaultOf w
+  _ <- S.mintShares w.shares alice 0.5 "outside"
+  tryS (redeemAll w w.operator [(alice, v.totalShares + 0.5, False)]) >>= assertFails (vaultErr "insufficient-assets")
+
+-- Request validity (`docs/SPEC.md` §4.2 `ensure`; §5.5)
+--------------------------------------------------------
+
+-- | A request with a non-positive amount or a negative `minOut` is refused
+-- at creation; the smallest valid ones are created.
+test_vault_invalidAmount_requests : Script ()
+test_vault_invalidAmount_requests = do
+  w <- setupWorld "invalid" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  let dep amount minOut = DepositRequest with
+        requester = alice; operator = w.operator; vaultId = w.vaultId
+        payAccount = basicAccount alice; receiver = basicAccount alice
+        amount; minOut; deadline = addRelTime now (days 1); funded = False; meta = emptyMetadata
+      red amount minOut = RedeemRequest with
+        requester = alice; operator = w.operator; vaultId = w.vaultId
+        payAccount = basicAccount alice; receiver = basicAccount alice
+        amount; minOut; deadline = addRelTime now (days 1); funded = False; meta = emptyMetadata
+  forA_ [(0.0, 0.0), (-u, 0.0), (u, -u)] $ \(a, m) -> do
+    trySubmit alice (createCmd (dep a m)) >>= assertFails (vaultErr "invalid-amount")
+    trySubmit alice (createCmd (red a m)) >>= assertFails (vaultErr "invalid-amount")
+  _ <- submit alice (createCmd (dep u 0.0))
+  _ <- submit alice (createCmd (red u 0.0))
+  pure ()
+
+-- | An asset addition of zero is refused; one unit is accepted.
+test_vault_invalidAmount_addAssets : Script ()
+test_vault_invalidAmount_addAssets = do
+  w <- setupWorld "invalid-add" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  (cid, _) <- vaultOf w
+  s <- addAssets w u
+  [(funding, _)] <- queryInterface @V2A.Allocation w.sponsor
+  trySubmit (actAs w.operator <> discloseMany s.disclosures) (exerciseCmd cid Vault_AddAssets with
+    amount = 0.0; source = basicAccount w.sponsor; funding; assetContext = underlyingArgs w.underlying)
+    >>= assertFails (vaultErr "invalid-amount")
+  attempt s >>= ok
+  totalsOf w >>= (=== (10.0 + u, 10.0))
+
+-- | An asset addition whose allocation is not the one it names is refused.
+test_vault_allocationMismatch_addAssets : Script ()
+test_vault_allocationMismatch_addAssets = do
+  w <- setupWorld "mismatch-add" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  s <- addAssets w 5.0
+  (cid, _) <- vaultOf w
+  allocations <- queryInterface @V2A.Allocation w.sponsor
+  let [(funding, _)] = allocations
+      addWith amount source = trySubmit (actAs w.operator <> discloseMany s.disclosures) $ exerciseCmd cid Vault_AddAssets with
+        amount; source; funding; assetContext = underlyingArgs w.underlying
+  addWith (5.0 + u) (basicAccount w.sponsor) >>= assertFails (vaultErr "allocation-mismatch")
+  addWith (5.0 - u) (basicAccount w.sponsor) >>= assertFails (vaultErr "allocation-mismatch")
+  addWith 5.0 (basicAccount alice) >>= assertFails (vaultErr "allocation-mismatch")
+  addWith 5.0 (basicAccount w.sponsor) >>= ok
+
+-- | An asset addition whose source is the vault
+-- account itself moves nothing into custody, so the vault refuses it before
+-- `A` could grow (`docs/SPEC.md` §5.5).
+test_vault_addAssets_refusesVaultAccountSource : Script ()
+test_vault_addAssets_refusesVaultAccountSource = do
+  w <- setupWorld "add-self" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  (cid, v) <- vaultOf w
+  now <- getTime
+  inputs <- underlyingHoldings w.underlying w.operator
+  d <- underlyingDisclosure w.underlying
+  let source = v.vaultAccount
+      settlement = V2A.SettlementInfo with
+        executors = [w.operator]; id = w.vaultId <> "/add-assets"; cid = Some (coerceContractId cid); meta = emptyMetadata
+      leg = V2A.TransferLeg with
+        transferLegId = "add"; sender = source; receiver = v.vaultAccount; amount = 10.0
+        instrumentId = v.asset.id; meta = emptyMetadata
+  res <- submit (actAs w.operator <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2.AllocationFactory w.underlying.rules) V2.AllocationFactory_Allocate with
+      settlement
+      allocation = allocationSpec w.underlying.admin source (senderSide leg) None False
+      requestedAt = now; inputHoldingCids = inputs; extraArgs = underlyingArgs w.underlying; actors = [w.operator]
+  funding <- completed res
+  trySubmit (actAs w.operator <> disclose d) (exerciseCmd cid Vault_AddAssets with
+      amount = 10.0; source; funding; assetContext = underlyingArgs w.underlying)
+    >>= assertFails (vaultErr "allocation-mismatch")
+  (_, after) <- vaultOf w
+  (after.totalAssets, after.totalShares) === (10.0, 10.0)
+
+-- Delegation (`docs/SPEC.md` §4.2, checks 1 to 4)
+---------------------------------------------------
+
+-- | The request's delegation choice, exercised by the operator directly:
+-- another vault, the deadline, the output leg and the slippage.
+test_vault_delegationChecks : Script ()
+test_vault_delegationChecks = do
+  w <- setupWorld "delegation" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  (req, _) <- newDepositUntil w alice 10.0 5.0 False deadline
+  (cid, v) <- vaultOf w
+  other <- submit w.operator $ createCmd v with vaultId = "other"
+  inputs <- underlyingHoldings w.underlying alice
+  ud <- underlyingDisclosure w.underlying
+  sd <- S.rulesDisclosure w.shares
+  ins <- tokenDisclosures alice inputs
+  let leg amount = outLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount alice) amount
+      delegate vaultCid l = trySubmit (actAs w.operator <> discloseMany (ud :: sd :: ins)) $
+        exerciseCmd req DepositRequest_Allocate with
+          vault = vaultCid; receiptLeg = l; fundingInputs = inputs
+          assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+  delegate other (leg 10.0) >>= assertFails (vaultErr "wrong-vault")
+  delegate cid ((leg 10.0) with receiver = basicAccount bob) >>= assertFails (vaultErr "allocation-mismatch")
+  delegate cid ((leg 10.0) with instrumentId = "other") >>= assertFails (vaultErr "allocation-mismatch")
+  delegate cid (leg (5.0 - u)) >>= assertFails (vaultErr "slippage")
+  delegate cid (leg 0.0) >>= assertFails (vaultErr "slippage")
+  -- A zero output is refused even with no minimum.
+  (req0, _) <- newDepositUntil w alice 10.0 0.0 False deadline
+  trySubmit (actAs w.operator <> discloseMany (ud :: sd :: ins)) (exerciseCmd req0 DepositRequest_Allocate with
+    vault = cid; receiptLeg = leg 0.0; fundingInputs = inputs
+    assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails (vaultErr "slippage")
+  setTime deadline
+  delegate cid (leg 10.0) >>= assertFails (vaultErr "request-expired")
+
+-- | `RedeemRequest_Allocate`'s own checks, exercised by
+-- the operator directly, as `test_vault_delegationChecks` does for deposits.
+test_vault_delegationChecks_redeem : Script ()
+test_vault_delegationChecks_redeem = do
+  w <- setupWorld "delegation-redeem" Permissioned 0 2
+  let [alice, bob] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 20.0, False)]
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  (req, _) <- newRedeemUntil w alice 10.0 5.0 False deadline
+  (cid, v) <- vaultOf w
+  other <- submit w.operator $ createCmd v with vaultId = "other"
+  inputs <- shareInputs w alice
+  ud <- underlyingDisclosure w.underlying
+  sd <- S.rulesDisclosure w.shares
+  let leg amount = outLeg Redeem v.vaultAccount v.asset v.shareInstrument (basicAccount alice) amount
+      delegate vaultCid l = trySubmit (actAs w.operator <> discloseMany [ud, sd]) $
+        exerciseCmd req RedeemRequest_Allocate with
+          vault = vaultCid; receiptLeg = l; fundingInputs = inputs
+          assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+  delegate other (leg 10.0) >>= assertFails (vaultErr "wrong-vault")
+  delegate cid ((leg 10.0) with receiver = basicAccount bob) >>= assertFails (vaultErr "allocation-mismatch")
+  delegate cid ((leg 10.0) with instrumentId = "other") >>= assertFails (vaultErr "allocation-mismatch")
+  delegate cid (leg (5.0 - u)) >>= assertFails (vaultErr "slippage")
+  setTime deadline
+  delegate cid (leg 10.0) >>= assertFails (vaultErr "request-expired")
+
+-- | Only the operator pauses, unpauses and adds
+-- assets, and a requester cannot exercise its own request's delegation.
+test_vault_onlyTheOperatorActs : Script ()
+test_vault_onlyTheOperatorActs = do
+  w <- setupWorld "only-operator" Permissioned 0 1
+  let [alice] = w.requesters
+  _ <- run =<< depositAll w w.operator [(alice, 10.0, False)]
+  (cid, v) <- vaultOf w
+  -- Alice is given the vault state, so that only authority decides.
+  let asAlice c = do
+        d <- fromSome <$> queryDisclosure w.operator c
+        pure (actAs alice <> disclose d)
+  opts <- asAlice cid
+  trySubmit opts (exerciseCmd cid Vault_Pause) >>= assertFails Authorization
+  _ <- run =<< pause w
+  (paused, _) <- vaultOf w
+  opts' <- asAlice paused
+  trySubmit opts' (exerciseCmd paused Vault_Unpause) >>= assertFails Authorization
+  _ <- run =<< unpause w
+  s <- addAssets w 1.0
+  (active, _) <- vaultOf w
+  opts'' <- asAlice active
+  trySubmit (opts'' <> discloseMany s.disclosures) s.commands >>= assertFails Authorization
+  (dep, _) <- newDeposit w alice 1.0 0.0 False
+  (red, _) <- newRedeem w alice 1.0 0.0 False
+  (cid', _) <- vaultOf w
+  vaultForAlice <- asAlice cid'
+  inputs <- underlyingHoldings w.underlying alice
+  let depLeg = outLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount alice) 1.0
+      redLeg = outLeg Redeem v.vaultAccount v.asset v.shareInstrument (basicAccount alice) 1.0
+  trySubmit vaultForAlice (exerciseCmd dep DepositRequest_Allocate with
+      vault = cid'; receiptLeg = depLeg; fundingInputs = inputs
+      assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails Authorization
+  trySubmit vaultForAlice (exerciseCmd red RedeemRequest_Allocate with
+      vault = cid'; receiptLeg = redLeg; fundingInputs = []
+      assetContext = underlyingArgs w.underlying; shareContext = S.noArgs)
+    >>= assertFails Authorization
+
+-- | A cancellation that names another request's allocation is refused.
+test_vault_allocationMismatch_cancel : Script ()
+test_vault_allocationMismatch_cancel = do
+  w <- setupWorld "cancel-other" Permissioned 0 1
+  let [alice] = w.requesters
+  (a, _) <- newDeposit w alice 10.0 0.0 False
+  (_, Some fb) <- newDeposit w alice 10.0 0.0 True
+  tryS (cancelDeposit w alice a [fb]) >>= assertFails (vaultErr "allocation-mismatch")
+  tryS (cancelDeposit w alice a []) >>= ok
+
+check : Text -> Bool -> Script ()
+check label cond = if cond then pure () else abort label
+
+-- | A funding allocation at a second TestTokenV2 registry, whose instrument
+-- has the same identifier, and one with next-iteration funding, are
+-- refused; the same allocation at the vault's registry executes.
+test_vault_allocationMismatch_registryAndIteration : Script ()
+test_vault_allocationMismatch_registryAndIteration = do
+  w <- setupWorld "registry" Permissioned 0 1
+  let [alice] = w.requesters
+  other <- setupUnderlying "underlying-other-registry"
+  mintUnderlying other alice 1000.0
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  (_, v) <- vaultOf w
+  let request = submit alice $ createCmd DepositRequest with
+        requester = alice; operator = w.operator; vaultId = w.vaultId
+        payAccount = basicAccount alice; receiver = basicAccount alice
+        amount = 10.0; minOut = 0.0; deadline; funded = True; meta = emptyMetadata
+      fundAt u req next = do
+        inputs <- underlyingHoldings u alice
+        ud <- underlyingDisclosure u
+        let leg = inLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount alice) 10.0
+            spec = allocationSpec u.admin (basicAccount alice) (senderSide leg) (Some deadline) False
+        res <- submit (actAs alice <> disclose ud) $
+          exerciseCmd (toInterfaceContractId @V2.AllocationFactory u.rules) V2.AllocationFactory_Allocate with
+            settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId req)
+            allocation = spec with nextIterationFunding = next
+            requestedAt = now; inputHoldingCids = inputs; extraArgs = underlyingArgs u; actors = [alice]
+        completed res
+      execute req a = tryS (executeDeposits w w.operator
+        [(alice, DepositItem with request = req; fundingAllocation = Some a; fundingInputs = [])])
+  r1 <- request
+  a1 <- fundAt other r1 None
+  execute r1 a1 >>= assertFails (vaultErr "allocation-mismatch")
+  r2 <- request
+  a2 <- fundAt w.underlying r2 (Some (TextMap.fromList [("X", 1.0)]))
+  execute r2 a2 >>= assertFails (vaultErr "allocation-mismatch")
+  r3 <- request
+  a3 <- fundAt w.underlying r3 None
+  execute r3 a3 >>= ok
+
+-- | The operator's delegation exercised outside an execution creates only
+-- allocations bound to the request, uncommitted, with the request's
+-- deadline, and the requester withdraws them before the deadline
+-- (`docs/SECURITY.md` §2, request allocations outside an execution).
+test_vault_delegationOutsideAnExecution : Script ()
+test_vault_delegationOutsideAnExecution = do
+  w <- setupWorld "delegation-outside" Permissioned 0 1
+  let [alice] = w.requesters
+  now <- getTime
+  let deadline = addRelTime now (days 1)
+  (req, _) <- newDepositUntil w alice 10.0 5.0 False deadline
+  (cid, v) <- vaultOf w
+  inputs <- underlyingHoldings w.underlying alice
+  ud <- underlyingDisclosure w.underlying
+  sd <- S.rulesDisclosure w.shares
+  ins <- tokenDisclosures alice inputs
+  let leg = outLeg Deposit v.vaultAccount v.asset v.shareInstrument (basicAccount alice) 10.0
+  res <- submit (actAs w.operator <> discloseMany (ud :: sd :: ins)) $ exerciseCmd req DepositRequest_Allocate with
+    vault = cid; receiptLeg = leg; fundingInputs = inputs
+    assetContext = underlyingArgs w.underlying; shareContext = S.noArgs
+  let settlement = requestSettlement w.operator w.vaultId Deposit (coerceContractId req)
+      funding = fromSome res.funding
+  forA_ [res.receipt, funding] $ \a -> do
+    found <- queryInterfaceContractId @V2A.Allocation alice a
+    let seen = fromSome found
+    (seen.settlement, seen.allocation.settlementDeadline, seen.allocation.committed) === (settlement, Some deadline, False)
+  positionOf w alice >>= (=== ((990.0, 10.0), (0.0, 0.0)))
+  locked <- lockedDisclosures w.underlying [funding]
+  _ <- submit (actAs alice <> discloseMany (ud :: locked)) $
+    exerciseCmd funding V2A.Allocation_Withdraw with actors = [alice]; extraArgs = underlyingArgs w.underlying
+  _ <- submit alice $ exerciseCmd res.receipt V2A.Allocation_Withdraw with actors = [alice]; extraArgs = S.noArgs
+  positionOf w alice >>= (=== ((1000.0, 0.0), (0.0, 0.0)))

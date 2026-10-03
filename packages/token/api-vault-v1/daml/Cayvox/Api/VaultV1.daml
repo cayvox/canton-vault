@@ -1,0 +1,64 @@
+-- | Cayvox vault API: the frozen interface through which wallets, indexers and
+-- other applications read a vault (`docs/DECISIONS.md`, D-12).
+--
+-- The package is an API package: it defines the interface `Vault`, its view
+-- and the view's `Mode` type, and no templates, choices or helper functions
+-- (`docs/CONVENTIONS.md`, section 2).
+module Cayvox.Api.VaultV1
+  ( Vault
+  , VaultView (..)
+  , Mode (..)
+  ) where
+
+import Splice.Api.Token.HoldingV2 (InstrumentId)
+import Splice.Api.Token.MetadataV1 (Metadata)
+
+-- | Who executes a vault's requests. The mode is fixed when the vault is
+-- created (D-05).
+data Mode
+  = Permissioned
+    -- ^ The operator executes requests.
+  | Permissionless
+    -- ^ Each requester executes its own requests, with the vault's authority
+    -- inside a vault choice.
+  deriving (Eq, Show)
+
+-- | A vault's identity and accounting, as the vault reports them.
+data VaultView = VaultView with
+    operator : Party
+      -- ^ The operator: signatory of the vault and admin of its share instrument.
+    vaultId : Text
+      -- ^ The vault's identifier; the operator keeps it unique among its vaults.
+    asset : InstrumentId
+      -- ^ The underlying instrument.
+    shareInstrument : InstrumentId
+      -- ^ The share instrument, whose admin is the operator.
+    totalAssets : Decimal
+      -- ^ The recorded underlying, `A` in `docs/MATH.md` §7.
+    totalShares : Decimal
+      -- ^ The share supply, `S` in `docs/MATH.md` §7.
+    decimalsOffset : Int
+      -- ^ The decimals offset `k` of `docs/MATH.md` §7, fixed at creation.
+    mode : Mode
+      -- ^ Who executes the vault's requests.
+    paused : Bool
+      -- ^ Whether deposits and asset additions are paused (D-14).
+    meta : Metadata
+      -- ^ Extension data (D-12).
+  deriving (Eq, Show)
+
+-- | A vault, read through its view.
+--
+-- * Signatories, observers and disclosure: those of the implementing
+--   template. The vault of `cvx-vault-v1` is signed by its operator, has no
+--   observers, and is read by explicit disclosure (D-15).
+-- * Choices and controllers: none. Every vault operation is a choice of the
+--   implementing template (D-12).
+-- * Authorization: the view states what the implementing template reports.
+--   A client that reads a vault through this interface identifies the
+--   implementing template, and its package, before relying on the view.
+-- * Archival and failure modes: none defined here.
+-- * Upgrades: an interface cannot be upgraded; a change is a new package
+--   ([canton-contracts `ARCHITECTURE.md`](https://github.com/OpenZeppelin/canton-contracts/blob/aeca01d043311d8ccc8ab7cda4d7c16e682429fa/ARCHITECTURE.md#L32-L33)).
+interface Vault where
+  viewtype VaultView

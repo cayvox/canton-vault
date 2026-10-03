@@ -1,0 +1,324 @@
+-- | Tests of the admission example, and the demo of the full flow.
+--
+-- The fixture builds what an operator deploys: a TestTokenV2 underlying
+-- (Splice 0.8.4), the vault's share registry (`ShareRules`), a Permissioned
+-- `VaultState` and an `AdmissionDesk`. Requesters are funded with
+-- underlying and create unfunded requests; the operator executes them
+-- through the desk.
+module Example.VaultAdmissionV1Test where
+
+import DA.Assert ((===))
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import DA.Optional (fromSome, isNone)
+import qualified DA.Text as T
+import qualified DA.TextMap as TextMap
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2 (Account (..), Holding, InstrumentId (..))
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferInstructionV2 as V2
+import Splice.Testing.Tokens.TestTokenV2
+  ( AccountConfig (..), PartyConfig (..), Token (..), TokenRules (..)
+  , TokenRules_OfferMint (..), accountConfigsContextKey )
+import Splice.Testing.Tokens.TestTokenV2.Util (tokenRulesContextKey)
+
+import Cayvox.Api.VaultV1 (Vault, VaultView)
+import Cayvox.Testing.Assert
+import Example.VaultAdmissionV1
+import Cayvox.VaultV1
+
+-- Fixture
+----------
+
+-- | What the operator deploys, and two prospective depositors. The vault
+-- account is the operator's basic account, which suits a test with one
+-- vault; an operator gives each vault its own account.
+data World = World with
+    admin : Party
+      -- ^ The underlying registry's admin.
+    rules : ContractId TokenRules
+    operator : Party
+    vaultId : Text
+    shareInstrument : InstrumentId
+    alice : Party
+    bob : Party
+
+-- | A party's basic account at a registry.
+accountOf : Party -> Account
+accountOf p = Account with owner = Some p; provider = None; id = ""
+
+assetOf : World -> InstrumentId
+assetOf w = InstrumentId with admin = w.admin; id = "X"
+
+-- | The choice context TestTokenV2 expects (Splice 0.8.4
+-- `TestTokenV2_RegistryV2.daml:342-354`).
+assetArgs : World -> ExtraArgs
+assetArgs w = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (accountConfigsContextKey, AV_List [])
+      , (tokenRulesContextKey, AV_ContractId (coerceContractId w.rules)) ]
+  meta = emptyMetadata
+
+noArgs : ExtraArgs
+noArgs = ExtraArgs (ChoiceContext TextMap.empty) emptyMetadata
+
+setup : Text -> Script World
+setup tag = do
+  admin <- allocateParty ("underlying-" <> tag)
+  rules <- submit admin $ createCmd TokenRules with admin
+  operator <- allocateParty ("operator-" <> tag)
+  alice <- allocateParty ("alice-" <> tag)
+  bob <- allocateParty ("bob-" <> tag)
+  let vaultId = "vault-" <> tag
+      shareInstrument = InstrumentId with admin = operator; id = vaultId
+      w = World with admin; rules; operator; vaultId; shareInstrument; alice; bob
+  shareRules <- submit operator $ createCmd ShareRules with
+    admin = operator; instrumentId = shareInstrument; meta = emptyMetadata
+  forA_ [alice, bob] (\p -> mint w p 1000.0)
+  _ <- submit operator $ createCmd VaultState with
+    operator; vaultId; asset = assetOf w; shareInstrument
+    vaultAccount = accountOf operator
+    mode = Permissioned
+    assetRegistry = RegistryRef with
+      allocationFactory = toInterfaceContractId rules; settlementFactory = toInterfaceContractId rules
+    shareRegistry = RegistryRef with
+      allocationFactory = toInterfaceContractId shareRules; settlementFactory = toInterfaceContractId shareRules
+    decimalsOffset = 0; totalAssets = 0.0; totalShares = 0.0; paused = False; meta = emptyMetadata
+  _ <- submit operator $ createCmd AdmissionDesk with operator; vaultId; admitted = []
+  pure w
+
+-- | Mint underlying to an owner through TestTokenV2's offer and accept.
+mint : World -> Party -> Decimal -> Script ()
+mint w owner amount = do
+  now <- getTime
+  res <- submit w.admin $ exerciseCmd w.rules TokenRules_OfferMint with
+    receiver = accountOf owner; amount; instrumentId = assetOf w; offeredAt = now
+    receiverConfig = AccountConfig with
+      admin = w.admin; account = accountOf owner; ownerConfig = PartyConfig True True; providerConfig = PartyConfig False False
+  d <- fromSome <$> queryDisclosure @TokenRules w.admin w.rules
+  _ <- submit (actAs owner <> disclose d) $
+    exerciseCmd (toInterfaceContractId @V2.TransferInstruction res.offerCid) V2.TransferInstruction_Accept with
+      actors = [owner]; extraArgs = assetArgs w
+  pure ()
+
+vaultOf : World -> Script (ContractId VaultState, VaultState)
+vaultOf w = do
+  vs <- query @VaultState w.operator
+  case [ x | x@(_, v) <- vs, v.vaultId == w.vaultId ] of
+    [x] -> pure x
+    other -> abort ("expected one vault state, found " <> show (length other))
+
+deskOf : World -> Script (ContractId AdmissionDesk)
+deskOf w = do
+  ds <- query @AdmissionDesk w.operator
+  case [ cid | (cid, d) <- ds, d.vaultId == w.vaultId ] of
+    [cid] -> pure cid
+    other -> abort ("expected one desk, found " <> show (length other))
+
+admit : World -> Party -> Script ()
+admit w p = do
+  desk <- deskOf w
+  _ <- submit w.operator $ exerciseCmd desk Desk_Admit with party = p
+  pure ()
+
+-- | Unlocked underlying holdings of an owner's basic account.
+underlying : World -> Party -> Script [(ContractId Token, Decimal)]
+underlying w p = do
+  ts <- query @Token p
+  pure [ (cid, t.holding.amount) | (cid, t) <- ts, t.holding.instrumentId == assetOf w
+       , t.holding.account == accountOf p, isNone t.holding.lock ]
+
+-- | Unlocked shares of an owner, read through the `Holding` interface.
+shares : World -> Party -> Script [(ContractId Holding, Decimal)]
+shares w p = do
+  hs <- queryInterface @Holding p
+  pure [ (cid, v.amount) | (cid, Some v) <- hs, v.instrumentId == w.shareInstrument
+       , v.account == accountOf p, isNone v.lock ]
+
+balance : [(a, Decimal)] -> Decimal
+balance = sum . map snd
+
+-- | A deposit request of `amount`, executed by the operator through the desk.
+-- Test settings: no minimum output and a one-day deadline keep the tests
+-- short; an application sets `minOut` from `previewDeposit` and a short
+-- deadline (the vault README's caveats).
+deposit : World -> Party -> Decimal -> Script (Either SubmitError ExecResult)
+deposit w p = depositTo w p p
+
+-- | A deposit request whose shares go to `receiver`'s basic account.
+depositTo : World -> Party -> Party -> Decimal -> Script (Either SubmitError ExecResult)
+depositTo w p receiver amount = do
+  now <- getTime
+  request <- submit p $ createCmd DepositRequest with
+    requester = p; operator = w.operator; vaultId = w.vaultId
+    payAccount = accountOf p; receiver = accountOf receiver
+    amount; minOut = 0.0; deadline = addRelTime now (days 1); funded = False; meta = emptyMetadata
+  inputs <- underlying w p
+  -- The operator sees neither the requester's tokens nor the registry's
+  -- rules: their parties disclose them.
+  held <- forA inputs (\(cid, _) -> fromSome <$> queryDisclosure p cid)
+  rulesD <- fromSome <$> queryDisclosure @TokenRules w.admin w.rules
+  (vault, _) <- vaultOf w
+  desk <- deskOf w
+  trySubmit (actAs w.operator <> discloseMany (rulesD :: held)) $ exerciseCmd desk Desk_ExecuteDeposits with
+    vault
+    items = [DepositItem with request; fundingAllocation = None; fundingInputs = map (toInterfaceContractId . fst) inputs]
+    assetContext = assetArgs w; shareContext = noArgs
+
+-- | A redemption request of `amount` shares, executed through the desk and
+-- paid from the vault account.
+redeem : World -> Party -> Decimal -> Script (Either SubmitError ExecResult)
+redeem w p amount = do
+  now <- getTime
+  request <- submit p $ createCmd RedeemRequest with
+    requester = p; operator = w.operator; vaultId = w.vaultId
+    payAccount = accountOf p; receiver = accountOf p
+    amount; minOut = 0.0; deadline = addRelTime now (days 1); funded = False; meta = emptyMetadata
+  inputs <- shares w p
+  pool <- underlying w w.operator
+  rulesD <- fromSome <$> queryDisclosure @TokenRules w.admin w.rules
+  (vault, _) <- vaultOf w
+  desk <- deskOf w
+  trySubmit (actAs w.operator <> disclose rulesD) $ exerciseCmd desk Desk_ExecuteRedeems with
+    vault
+    items = [RedeemItem with
+      request; fundingAllocation = None; fundingInputs = map fst inputs
+      vaultInputs = map (toInterfaceContractId . fst) pool]
+    assetContext = assetArgs w; shareContext = noArgs
+
+-- | The vault's view, read through the `Vault` interface of `cvx-api-vault-v1`.
+viewOf : World -> Script VaultView
+viewOf w = do
+  (cid, _) <- vaultOf w
+  fromSome <$> queryInterfaceContractId w.operator (toInterfaceContractId @Vault cid)
+
+example : Text -> Expected
+example name = Status ("cayvox.com/example-" <> name) InvalidGivenCurrentSystemStateOther
+
+vaultError : Text -> Expected
+vaultError name = Status ("cayvox.com/vault-" <> name) InvalidGivenCurrentSystemStateOther
+
+-- Tests
+--------
+
+-- | An admitted party deposits; the vault mints its shares at one share per
+-- unit, the first deposit's price.
+test_admission_admittedDepositExecutes : Script ()
+test_admission_admittedDepositExecutes = do
+  w <- setup "admitted"
+  admit w w.alice
+  Right res <- deposit w w.alice 100.0
+  res.outputs === [100.0]
+  (balance <$> shares w w.alice) >>= (=== 100.0)
+  (balance <$> underlying w w.alice) >>= (=== 900.0)
+  v <- viewOf w
+  (v.totalAssets, v.totalShares) === (100.0, 100.0)
+
+-- | The on-ledger admission check: a party that is not admitted cannot
+-- deposit, and nothing changes; removing a party stops its deposits.
+test_admission_refusesOthers : Script ()
+test_admission_refusesOthers = do
+  w <- setup "refuses"
+  admit w w.alice
+  deposit w w.bob 50.0 >>= assertFails (example "not-admitted")
+  (balance <$> underlying w w.bob) >>= (=== 1000.0)
+  v <- viewOf w
+  (v.totalAssets, v.totalShares) === (0.0, 0.0)
+  -- An admitted requester cannot send the shares to a party that is not.
+  depositTo w w.alice w.bob 50.0 >>= assertFails (example "not-admitted")
+  desk <- deskOf w
+  _ <- submit w.operator $ exerciseCmd desk Desk_Remove with party = w.alice
+  deposit w w.alice 50.0 >>= assertFails (example "not-admitted")
+
+-- | The pause flag: while paused, deposits fail, and redemptions still pay
+-- out: admission and the pause never block a redemption (D-14).
+test_admission_pauseBlocksDepositsOnly : Script ()
+test_admission_pauseBlocksDepositsOnly = do
+  w <- setup "pause"
+  admit w w.alice
+  Right _ <- deposit w w.alice 100.0
+  (vault, _) <- vaultOf w
+  _ <- submit w.operator $ exerciseCmd vault Vault_Pause
+  v <- viewOf w
+  v.paused === True
+  deposit w w.alice 10.0 >>= assertFails (vaultError "paused")
+  Right res <- redeem w w.alice 40.0
+  res.outputs === [40.0]
+  (balance <$> underlying w w.alice) >>= (=== 940.0)
+
+-- | A desk executes only its own vault.
+test_admission_onlyItsVault : Script ()
+test_admission_onlyItsVault = do
+  w <- setup "own-vault"
+  (_, v) <- vaultOf w
+  other <- submit w.operator $ createCmd v with vaultId = "other"
+  admit w w.alice
+  now <- getTime
+  request <- submit w.alice $ createCmd DepositRequest with
+    requester = w.alice; operator = w.operator; vaultId = "other"
+    payAccount = accountOf w.alice; receiver = accountOf w.alice
+    amount = 1.0; minOut = 0.0; deadline = addRelTime now (days 1); funded = False; meta = emptyMetadata
+  desk <- deskOf w
+  trySubmit w.operator (exerciseCmd desk Desk_ExecuteDeposits with
+      vault = other; items = [DepositItem with request; fundingAllocation = None; fundingInputs = []]
+      assetContext = assetArgs w; shareContext = noArgs)
+    >>= assertFails (example "wrong-vault")
+
+-- | The operator closes the desk by archiving it: the desk is gone, and the
+-- vault and the shares already issued are unchanged.
+test_admission_operatorClosesDesk : Script ()
+test_admission_operatorClosesDesk = do
+  w <- setup "close"
+  admit w w.alice
+  Right _ <- deposit w w.alice 100.0
+  desk <- deskOf w
+  submit w.operator $ archiveCmd desk
+  ds <- query @AdmissionDesk w.operator
+  [ cid | (cid, d) <- ds, d.vaultId == w.vaultId ] === []
+  (balance <$> shares w w.alice) >>= (=== 100.0)
+  v <- viewOf w
+  (v.totalAssets, v.totalShares) === (100.0, 100.0)
+
+-- Demo
+-------
+
+say : Text -> Script ()
+say = debugRaw
+
+-- | The full flow, printing each step: deployment, admission, a refused
+-- deposit, two deposits, a pause, a deposit refused while paused, and a
+-- redemption that still pays.
+demo : Script ()
+demo = do
+  w <- setup "demo"
+  say "1. Deployed: a TestTokenV2 underlying, the share registry, a Permissioned vault and its admission desk."
+  say "   Alice and Bob each hold 1000.0 of the underlying."
+  admit w w.alice
+  say "2. The operator admits Alice."
+  deposit w w.bob 50.0 >>= \r -> say ("3. Bob, not admitted, asks to deposit 50.0: " <> outcome r)
+  deposit w w.alice 100.0 >>= \r -> say ("4. Alice deposits 100.0: " <> outcome r)
+  admit w w.bob
+  deposit w w.bob 50.0 >>= \r -> say ("5. Bob is admitted and deposits 50.0: " <> outcome r)
+  v <- viewOf w
+  say ("6. The vault, read through the Vault interface: totalAssets " <> show v.totalAssets <> ", totalShares " <> show v.totalShares)
+  (vault, _) <- vaultOf w
+  _ <- submit w.operator $ exerciseCmd vault Vault_Pause
+  say "7. The operator pauses the vault."
+  deposit w w.alice 10.0 >>= \r -> say ("8. Alice asks to deposit 10.0 while paused: " <> outcome r)
+  redeem w w.alice 40.0 >>= \r -> say ("9. Alice redeems 40.0 shares while paused: " <> outcome r)
+  aliceShares <- balance <$> shares w w.alice
+  aliceUnderlying <- balance <$> underlying w w.alice
+  v' <- viewOf w
+  say ("10. Alice holds " <> show aliceShares <> " shares and " <> show aliceUnderlying <> " underlying; the vault holds totalAssets "
+    <> show v'.totalAssets <> ", totalShares " <> show v'.totalShares <> ", paused " <> show v'.paused <> ".")
+  where
+    outcome (Right res) = "executed, output " <> T.intercalate ", " (map show res.outputs)
+    outcome (Left e) = "refused: " <> errorIdOf (show e)
+    errorIdOf t = case T.splitOn "errorId = \"" t of
+      _ :: rest :: _ -> case T.splitOn "\"" rest of
+        x :: _ -> x
+        [] -> rest
+      _ -> T.take 160 t

@@ -1,0 +1,12 @@
+# Daml build state
+.daml/
+.cache/
+
+# Test and coverage reports (rebuilt by the check scripts)
+test-reports/
+
+# OS files
+.DS_Store
+
+# Logs kept by scripts/ci.sh from each run
+ci-logs/

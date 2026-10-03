@@ -1,0 +1,212 @@
+-- | Share registry tests: the preconditions of the templates the registry
+-- creates, each checked on a direct create by the signatories (T-13, T-16;
+-- `docs/REGISTRY-MUSTS.md`, section 10). Every test first creates the valid
+-- contract, then fails one condition.
+module Cayvox.VaultV1Test.Preconditions where
+
+import qualified DA.Text as T
+import qualified DA.TextMap as TextMap
+import DA.Time (addRelTime, seconds)
+import Daml.Script
+
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard
+import Cayvox.VaultV1Test.Setup
+
+-- | A text of the given length.
+textOf : Int -> Text
+textOf n = T.implode (replicate n "a")
+
+-- | Metadata with `n` entries.
+metaOf : Int -> Metadata
+metaOf n = Metadata with values = TextMap.fromList [ (show i, "v") | i <- [1 .. n] ]
+
+-- Holdings
+-----------
+
+-- | A holding of Alice's, created by the operator and Alice.
+holdingFixture : Text -> Script (Registry, Party, ShareHolding)
+holdingFixture tag = do
+  reg <- setupRegistry tag
+  alice <- allocateParty ("alice-" <> tag)
+  let holding = ShareHolding with
+        admin = reg.operator; instrumentId = reg.instrument; account = basicAccount alice
+        amount = 1.0; lock = None; lockObservers = []; meta = emptyMetadata
+  _ <- submit (actAs [reg.operator, alice]) (createCmd holding)
+  pure (reg, alice, holding)
+
+-- | A holding of zero shares.
+test_holding_rejectsZeroAmount : Script ()
+test_holding_rejectsZeroAmount = do
+  (reg, alice, holding) <- holdingFixture "pre-hold-zero"
+  trySubmit (actAs [reg.operator, alice]) (createCmd (holding with amount = 0.0)) >>= assertFails PreconditionViolated
+
+-- | A holding of an instrument of another admin.
+test_holding_rejectsInstrumentOfAnotherAdmin : Script ()
+test_holding_rejectsInstrumentOfAnotherAdmin = do
+  (reg, alice, holding) <- holdingFixture "pre-hold-admin"
+  trySubmit (actAs [reg.operator, alice]) (createCmd (holding with instrumentId = (reg.instrument with admin = alice)))
+    >>= assertFails PreconditionViolated
+
+-- Allocations
+--------------
+
+-- | Bob's receiving allocation of a leg from Alice, created by the operator
+-- and Bob.
+allocationFixture : Text -> Script (Registry, Party, TransferLeg, ShareAllocation)
+allocationFixture tag = do
+  reg <- setupRegistry tag
+  alice <- allocateParty ("alice-" <> tag)
+  bob <- allocateParty ("bob-" <> tag)
+  now <- getTime
+  let leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+      allocation = ShareAllocation with
+        admin = reg.operator; instrumentId = reg.instrument; settlement = settlementOf reg "s"
+        allocation = specOf reg (basicAccount bob) [receiverSide leg] None False
+        lockedHoldingCid = None; createdAt = now
+  _ <- submit (actAs [reg.operator, bob]) (createCmd allocation)
+  pure (reg, bob, leg, allocation)
+
+-- | The allocation fails its precondition when created by the operator and Bob.
+allocationRejected : Registry -> Party -> ShareAllocation -> Script ()
+allocationRejected reg bob allocation =
+  trySubmit (actAs [reg.operator, bob]) (createCmd allocation) >>= assertFails PreconditionViolated
+
+-- | A specification of another admin.
+test_allocation_rejectsSpecificationOfAnotherAdmin : Script ()
+test_allocation_rejectsSpecificationOfAnotherAdmin = do
+  (reg, bob, _, a) <- allocationFixture "pre-alloc-admin"
+  allocationRejected reg bob (a with allocation = (a.allocation with admin = bob))
+
+-- | A settlement without executors, and one with an identifier of 257
+-- characters.
+test_allocation_rejectsUnboundedSettlement : Script ()
+test_allocation_rejectsUnboundedSettlement = do
+  (reg, bob, _, a) <- allocationFixture "pre-alloc-settlement"
+  allocationRejected reg bob (a with settlement = (a.settlement with executors = []))
+  allocationRejected reg bob (a with settlement = (a.settlement with id = textOf 257))
+
+-- | No leg side, and 26 leg sides.
+test_allocation_rejectsLegCountOutOfBounds : Script ()
+test_allocation_rejectsLegCountOutOfBounds = do
+  (reg, bob, leg, a) <- allocationFixture "pre-alloc-legs"
+  allocationRejected reg bob (a with allocation = (a.allocation with transferLegSides = []))
+  let sides = [ receiverSide (leg with transferLegId = "l" <> show i) | i <- [1 .. 26] ]
+  allocationRejected reg bob (a with allocation = (a.allocation with transferLegSides = sides))
+
+-- | A leg side with an identifier of 257 characters.
+test_allocation_rejectsUnboundedLegSide : Script ()
+test_allocation_rejectsUnboundedLegSide = do
+  (reg, bob, leg, a) <- allocationFixture "pre-alloc-side"
+  allocationRejected reg bob (a with allocation = (a.allocation with transferLegSides = [receiverSide (leg with transferLegId = textOf 257)]))
+
+-- | Funding for a next iteration.
+test_allocation_rejectsNextIterationFunding : Script ()
+test_allocation_rejectsNextIterationFunding = do
+  (reg, bob, _, a) <- allocationFixture "pre-alloc-iteration"
+  allocationRejected reg bob (a with allocation = (a.allocation with nextIterationFunding = Some TextMap.empty))
+
+-- | An authorizer that is neither a regular account nor a special account of
+-- CIP-0112.
+test_allocation_rejectsInvalidAuthorizer : Script ()
+test_allocation_rejectsInvalidAuthorizer = do
+  (reg, bob, _, a) <- allocationFixture "pre-alloc-authorizer"
+  let other = Account with owner = None; provider = None; id = "cip-112/other"
+  allocationRejected reg bob (a with allocation = (a.allocation with authorizer = other))
+  allocationRejected reg bob (a with allocation = (a.allocation with authorizer = basicAccount reg.operator))
+
+-- | A leg side of zero or negative amount.
+test_allocation_rejectsNonPositiveLegAmount : Script ()
+test_allocation_rejectsNonPositiveLegAmount = do
+  (reg, bob, leg, a) <- allocationFixture "pre-alloc-amount"
+  allocationRejected reg bob (a with allocation = (a.allocation with transferLegSides = [receiverSide (leg with amount = 0.0)]))
+  allocationRejected reg bob (a with allocation = (a.allocation with transferLegSides = [receiverSide (leg with amount = -1.0)]))
+
+-- | A special account on the other side: `cip-112/mint` receiving and
+-- `cip-112/burn` sending. Their own sides are accepted.
+test_allocation_rejectsSpecialAccountOnTheWrongSide : Script ()
+test_allocation_rejectsSpecialAccountOnTheWrongSide = do
+  (reg, _, leg, a) <- allocationFixture "pre-alloc-side"
+  let special account sides = a with allocation = (a.allocation with authorizer = account; transferLegSides = sides)
+      rejectedByOperator x = trySubmit reg.operator (createCmd x) >>= assertFails PreconditionViolated
+      acceptedByOperator x = submit reg.operator (createCmd x) >> pure ()
+  rejectedByOperator (special mintAccount [receiverSide leg])
+  rejectedByOperator (special burnAccount [senderSide leg])
+  acceptedByOperator (special mintAccount [senderSide leg])
+  acceptedByOperator (special burnAccount [receiverSide leg])
+
+-- | A committed allocation without a settlement deadline.
+test_allocation_rejectsCommittedWithoutDeadline : Script ()
+test_allocation_rejectsCommittedWithoutDeadline = do
+  (reg, bob, _, a) <- allocationFixture "pre-alloc-committed"
+  allocationRejected reg bob (a with allocation = (a.allocation with committed = True))
+
+-- | An authorizer identifier of 257 characters, and metadata of 17 entries.
+test_allocation_rejectsUnboundedAuthorizerAndMeta : Script ()
+test_allocation_rejectsUnboundedAuthorizerAndMeta = do
+  (reg, bob, _, a) <- allocationFixture "pre-alloc-meta"
+  allocationRejected reg bob (a with allocation = (a.allocation with authorizer = ((basicAccount bob) with id = textOf 257)))
+  allocationRejected reg bob (a with allocation = (a.allocation with meta = metaOf 17))
+
+-- Transfer instructions
+------------------------
+
+-- | A pending transfer from Alice to Bob, created by the operator and Alice.
+instructionFixture : Text -> Script (Registry, Party, ShareTransferInstruction)
+instructionFixture tag = do
+  reg <- setupRegistry tag
+  alice <- allocateParty ("alice-" <> tag)
+  bob <- allocateParty ("bob-" <> tag)
+  h <- mintShares reg alice 1.0 tag
+  now <- getTime
+  let instruction = ShareTransferInstruction with
+        admin = reg.operator
+        transfer = Transfer with
+          sender = basicAccount alice; receiver = basicAccount bob; amount = 1.0
+          instrumentId = reg.instrument; requestedAt = now; executeBefore = addRelTime now (seconds 60)
+          inputHoldingCids = []; meta = emptyMetadata
+        lockedHoldingCid = fromInterfaceContractId h
+  _ <- submit (actAs [reg.operator, alice]) (createCmd instruction)
+  pure (reg, alice, instruction)
+
+-- | The instruction fails its precondition when created by the operator and Alice.
+instructionRejected : Registry -> Party -> ShareTransferInstruction -> Script ()
+instructionRejected reg alice instruction =
+  trySubmit (actAs [reg.operator, alice]) (createCmd instruction) >>= assertFails PreconditionViolated
+
+-- | An instrument of another admin.
+test_transferInstruction_rejectsInstrumentOfAnotherAdmin : Script ()
+test_transferInstruction_rejectsInstrumentOfAnotherAdmin = do
+  (reg, alice, i) <- instructionFixture "pre-instr-admin"
+  instructionRejected reg alice (i with transfer = (i.transfer with instrumentId = (reg.instrument with admin = alice)))
+
+-- | An amount of zero.
+test_transferInstruction_rejectsZeroAmount : Script ()
+test_transferInstruction_rejectsZeroAmount = do
+  (reg, alice, i) <- instructionFixture "pre-instr-amount"
+  instructionRejected reg alice (i with transfer = (i.transfer with amount = 0.0))
+
+-- | A sender account of the operator.
+test_transferInstruction_rejectsSenderOfOperator : Script ()
+test_transferInstruction_rejectsSenderOfOperator = do
+  (reg, alice, i) <- instructionFixture "pre-instr-sender"
+  instructionRejected reg alice (i with transfer = (i.transfer with sender = basicAccount reg.operator))
+
+-- | A special receiver account.
+test_transferInstruction_rejectsSpecialReceiver : Script ()
+test_transferInstruction_rejectsSpecialReceiver = do
+  (reg, alice, i) <- instructionFixture "pre-instr-receiver"
+  instructionRejected reg alice (i with transfer = (i.transfer with receiver = burnAccount))
+
+-- | A receiver identifier of 257 characters, and metadata of 17 entries.
+test_transferInstruction_rejectsUnboundedTransfer : Script ()
+test_transferInstruction_rejectsUnboundedTransfer = do
+  (reg, alice, i) <- instructionFixture "pre-instr-bounds"
+  instructionRejected reg alice (i with transfer = (i.transfer with receiver = (i.transfer.receiver with id = textOf 257)))
+  instructionRejected reg alice (i with transfer = (i.transfer with meta = metaOf 17))

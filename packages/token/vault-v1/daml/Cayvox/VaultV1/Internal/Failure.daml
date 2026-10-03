@@ -1,0 +1,201 @@
+-- | The failures of `cvx-vault-v1`, built by one constructor (D-13): the
+-- identifier `cayvox.com/<name>`, the category
+-- `InvalidGivenCurrentSystemStateOther`, and empty `meta`. Clients match the
+-- identifier, never the message.
+module Cayvox.VaultV1.Internal.Failure
+  ( failure
+  , raise
+  , require
+    -- * Vault failures
+  , vaultUnauthorizedExecutor
+  , vaultPaused
+  , vaultAlreadyPaused
+  , vaultNotPaused
+  , vaultBatchSize
+  , vaultDuplicateRequest
+  , vaultWrongVault
+  , vaultRequestExpired
+  , vaultAllocationMismatch
+  , vaultZeroShares
+  , vaultZeroAssets
+  , vaultSlippage
+  , vaultCapacityExceeded
+  , vaultInsufficientAssets
+  , vaultNoShares
+  , vaultInvalidAmount
+    -- * Share registry failures
+  , registryWrongAdmin
+  , registryWrongInstrument
+  , registryUnauthorizedActors
+  , registryInvalidAccount
+  , registryInvalidAmount
+  , registryIteratedSettlement
+  , registryDeadlinePassed
+  , registryNotYetRequested
+  , registryInvalidInputHolding
+  , registryInsufficientFunds
+  , registryNoTransferLegs
+  , registryDuplicateLeg
+  , registrySettlementMismatch
+  , registryMissingAuthorization
+  , registrySuperfluousAuthorization
+  , registryCommittedAllocation
+  , registryCommittedWithoutDeadline
+  , registryFieldTooLarge
+  ) where
+
+import DA.Fail (FailureCategory (..), FailureStatus (..), failWithStatus)
+import qualified DA.TextMap as TextMap
+
+-- | A failure of this package.
+failure : Text -> Text -> FailureStatus
+failure name message = FailureStatus with
+  errorId = "cayvox.com/" <> name
+  category = InvalidGivenCurrentSystemStateOther
+  message
+  meta = TextMap.empty
+
+-- | Fail the transaction with the given failure.
+raise : FailureStatus -> Update a
+raise = failWithStatus
+
+-- | Fail with the given failure unless the condition holds.
+require : FailureStatus -> Bool -> Update ()
+require status cond = if cond then pure () else failWithStatus status
+
+-- | The executor may not execute these requests (`docs/SPEC.md` §5.3 step 1).
+vaultUnauthorizedExecutor : FailureStatus
+vaultUnauthorizedExecutor = failure "vault-unauthorized-executor" "the executor may not execute these requests"
+
+-- | Deposits and asset additions are paused.
+vaultPaused : FailureStatus
+vaultPaused = failure "vault-paused" "the vault is paused"
+
+-- | The vault is already paused.
+vaultAlreadyPaused : FailureStatus
+vaultAlreadyPaused = failure "vault-already-paused" "the vault is already paused"
+
+-- | The vault is not paused.
+vaultNotPaused : FailureStatus
+vaultNotPaused = failure "vault-not-paused" "the vault is not paused"
+
+-- | A batch holds no request, or more than the cap.
+vaultBatchSize : FailureStatus
+vaultBatchSize = failure "vault-batch-size" "a batch holds 1 to 25 requests"
+
+-- | A request appears twice in one batch.
+vaultDuplicateRequest : FailureStatus
+vaultDuplicateRequest = failure "vault-duplicate-request" "a request appears twice in the batch"
+
+-- | The request or the vault is not the one the other names.
+vaultWrongVault : FailureStatus
+vaultWrongVault = failure "vault-wrong-vault" "the request names another vault"
+
+-- | Ledger time is at or after the request's deadline.
+vaultRequestExpired : FailureStatus
+vaultRequestExpired = failure "vault-request-expired" "ledger time is at or after the request deadline"
+
+-- | An allocation or a leg does not match the request it is used for.
+vaultAllocationMismatch : FailureStatus
+vaultAllocationMismatch = failure "vault-allocation-mismatch" "the allocation does not match the request"
+
+-- | A deposit would mint no shares.
+vaultZeroShares : FailureStatus
+vaultZeroShares = failure "vault-zero-shares" "the deposit would mint no shares"
+
+-- | A redemption would pay no assets.
+vaultZeroAssets : FailureStatus
+vaultZeroAssets = failure "vault-zero-assets" "the redemption would pay no assets"
+
+-- | The output is below the request's minimum.
+vaultSlippage : FailureStatus
+vaultSlippage = failure "vault-slippage" "the output is below minOut"
+
+-- | A redemption would pay more than the vault's recorded assets.
+vaultInsufficientAssets : FailureStatus
+vaultInsufficientAssets = failure "vault-insufficient-assets" "the redemption exceeds the vault's assets"
+
+-- | Assets are added to a vault without shares.
+vaultNoShares : FailureStatus
+vaultNoShares = failure "vault-no-shares" "assets added to a vault with no shares belong to no holder"
+
+-- | An amount is not positive, or a minimum output is negative.
+vaultInvalidAmount : FailureStatus
+vaultInvalidAmount = failure "vault-invalid-amount" "the amount must be positive and the minimum output not negative"
+
+-- | A view outside the bounds of `docs/MATH.md` §7, or an amount that would
+-- take the vault past its asset bound.
+vaultCapacityExceeded : FailureStatus
+vaultCapacityExceeded = failure "vault-capacity-exceeded" "the vault state or the amount is outside the vault's bounds"
+
+-- | The allocation or instrument is administered by another party.
+registryWrongAdmin : FailureStatus
+registryWrongAdmin = failure "registry-wrong-admin" "the admin is not this registry's admin"
+
+-- | The instrument is not this registry's share instrument.
+registryWrongInstrument : FailureStatus
+registryWrongInstrument = failure "registry-wrong-instrument" "the instrument is not this registry's instrument"
+
+-- | The actors are not a group allowed to take the action.
+registryUnauthorizedActors : FailureStatus
+registryUnauthorizedActors = failure "registry-unauthorized-actors" "the actors may not take this action"
+
+-- | The account is not one this registry supports for the action.
+registryInvalidAccount : FailureStatus
+registryInvalidAccount = failure "registry-invalid-account" "the account is not valid for this action"
+
+-- | An amount is not positive.
+registryInvalidAmount : FailureStatus
+registryInvalidAmount = failure "registry-invalid-amount" "an amount is not positive"
+
+-- | Iterated settlement was requested; the registry does not support it (D-07).
+registryIteratedSettlement : FailureStatus
+registryIteratedSettlement = failure "registry-iterated-settlement" "iterated settlement is not supported"
+
+-- | A settlement deadline or `executeBefore` has been reached.
+registryDeadlinePassed : FailureStatus
+registryDeadlinePassed = failure "registry-deadline-passed" "the deadline has been reached"
+
+-- | `requestedAt` is later than the ledger time.
+registryNotYetRequested : FailureStatus
+registryNotYetRequested = failure "registry-not-yet-requested" "requestedAt is in the future"
+
+-- | An input holding is not an unlocked share holding of the account.
+registryInvalidInputHolding : FailureStatus
+registryInvalidInputHolding = failure "registry-invalid-input-holding" "an input holding is not usable for this account"
+
+-- | The input holdings do not cover the amount.
+registryInsufficientFunds : FailureStatus
+registryInsufficientFunds = failure "registry-insufficient-funds" "the input holdings do not cover the amount"
+
+-- | A settlement has no transfer leg.
+registryNoTransferLegs : FailureStatus
+registryNoTransferLegs = failure "registry-no-transfer-legs" "there must be at least one transfer leg"
+
+-- | A transfer leg identifier or an authorization appears twice.
+registryDuplicateLeg : FailureStatus
+registryDuplicateLeg = failure "registry-duplicate-leg" "a transfer leg or authorization appears twice"
+
+-- | An allocation was created for another settlement.
+registrySettlementMismatch : FailureStatus
+registrySettlementMismatch = failure "registry-settlement-mismatch" "the allocation is for another settlement"
+
+-- | A transfer leg side has no allocation authorizing it.
+registryMissingAuthorization : FailureStatus
+registryMissingAuthorization = failure "registry-missing-authorization" "a transfer leg side is not authorized"
+
+-- | An allocation authorizes a leg side the settlement does not transfer.
+registrySuperfluousAuthorization : FailureStatus
+registrySuperfluousAuthorization = failure "registry-superfluous-authorization" "an allocation authorizes a leg side that is not settled"
+
+-- | A committed allocation is withdrawn before its settlement deadline.
+registryCommittedAllocation : FailureStatus
+registryCommittedAllocation = failure "registry-committed-allocation" "a committed allocation cannot be withdrawn before its settlement deadline"
+
+-- | A committed allocation without a settlement deadline.
+registryCommittedWithoutDeadline : FailureStatus
+registryCommittedWithoutDeadline = failure "registry-committed-without-deadline" "a committed allocation needs a settlement deadline"
+
+-- | A text, list or metadata field exceeds its bound (T-16).
+registryFieldTooLarge : FailureStatus
+registryFieldTooLarge = failure "registry-field-too-large" "a field exceeds its bound"

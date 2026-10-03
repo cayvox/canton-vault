@@ -1,0 +1,125 @@
+-- | How a redemption batch gets a separate set of
+-- vault-account holdings for each request. `probeR30` measures, at the
+-- TestTokenV2 underlying, what each way costs; `docs/SPEC.md` §5.4 states
+-- the one the vault uses. Run through `dpm script`. Not a test: it takes an input.
+module Cayvox.VaultV1Test.R30
+  ( R30Input (..)
+  , ChainProbe (..)
+  , ChainProbe_Allocate (..)
+  , probeR30
+  ) where
+
+import DA.Action (foldlA)
+import DA.Foldable (forA_)
+import DA.List (head, last, sortOn)
+import qualified DA.TextMap as TextMap
+import qualified DA.Text as T
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferInstructionV2 as T2
+
+import Cayvox.VaultV1 (Mode (..))
+import Cayvox.VaultV1.Internal.TokenStandard (basicAccount, senderSide)
+import qualified Cayvox.VaultV1Test.Setup as S
+import Cayvox.VaultV1Test.Underlying
+import Cayvox.VaultV1Test.VaultSetup
+
+-- | The number of payments each option is measured for.
+data R30Input = R30Input with
+    sizes : [Int]
+    tag : Text
+  deriving (Eq, Show)
+
+-- | Option (c2): one transaction allocates `amounts` from the vault account,
+-- each allocation funded by the change the previous one returned
+-- (`authorizerChangeCids`, Splice 0.8.4 `AllocationInstructionV2.daml:199-203`),
+-- starting from `inputs`. Signed by the operator alone, as `VaultState` is.
+template ChainProbe
+  with
+    operator : Party
+  where
+    signatory operator
+
+    nonconsuming choice ChainProbe_Allocate : [ContractId Allocation]
+      with
+        factory : ContractId AllocationFactory
+        admin : Party
+        instrumentId : Text
+        receiver : Account
+        amounts : [Decimal]
+        inputs : [ContractId Holding]
+        deadline : Time
+        extraArgs : ExtraArgs
+      controller operator
+      do
+        now <- getTime
+        let account = basicAccount operator
+            step (acc, pool) (i, amount) = do
+              let leg = TransferLeg with
+                    transferLegId = "out-" <> show i; sender = account; receiver; amount; instrumentId; meta = emptyMetadata
+                  settlement = SettlementInfo with
+                    executors = [operator]; id = "r30-" <> show i; cid = None; meta = emptyMetadata
+              res <- exercise factory AllocationFactory_Allocate with
+                settlement
+                allocation = AllocationSpecification with
+                  admin; authorizer = account; transferLegSides = [senderSide leg]
+                  settlementDeadline = Some deadline; nextIterationFunding = None; committed = False; meta = emptyMetadata
+                requestedAt = now; inputHoldingCids = pool; extraArgs; actors = [operator]
+              cid <- case res.output of
+                AllocationInstructionResult_Completed {allocationCid} -> pure allocationCid
+                _ -> abort "allocation not completed"
+              pure (cid :: acc, concatMap snd (TextMap.toList res.authorizerChangeCids))
+        (cids, _) <- foldlA step ([], inputs) (zip [1 .. length amounts] amounts)
+        pure (reverse cids)
+
+-- | For each size n: (a, d) the vault account's holdings after n deposits and
+-- after one redemption that names them all; (c1, b) the nodes of the n - 1
+-- self-transfers that split one holding into n; (c2) the nodes of n
+-- allocations chained through their change in one transaction.
+probeR30 : R30Input -> Script [Text]
+probeR30 input = forA input.sizes $ \n -> do
+  w <- setupWorldWith ("r30-" <> input.tag <> "-" <> show n) Permissioned 0 n 100.0
+  forA_ w.requesters $ \p -> run =<< depositAll w w.operator [(p, 10.0, False)]
+  afterDeposits <- accountHoldings w.underlying (basicAccount w.operator)
+  _ <- run =<< redeemAll w w.operator [(head w.requesters, 1.0, False)]
+  afterRedeem <- accountHoldings w.underlying (basicAccount w.operator)
+  -- (c1, b): split the one remaining holding into n by self-transfers.
+  ud <- underlyingDisclosure w.underlying
+  now <- getTime
+  let account = basicAccount w.operator
+      -- The vault account's largest holding.
+      largest = do
+        held <- accountHoldings w.underlying account
+        pure (fst (last (sortOn snd held)))
+      selfTransfer amount = do
+        big <- largest
+        tree <- submitTree (actAs w.operator <> disclose ud) $
+          exerciseCmd (toInterfaceContractId @T2.TransferFactory w.underlying.rules) T2.TransferFactory_Transfer with
+            transfer = T2.Transfer with
+              sender = account; receiver = account; amount; instrumentId = underlyingInstrument w.underlying
+              requestedAt = now; executeBefore = addRelTime now (days 1); inputHoldingCids = [big]; meta = emptyMetadata
+            actors = [w.operator]; extraArgs = underlyingArgs w.underlying
+        pure (length (S.flatten tree.rootEvents))
+  splitNodes <- forA [1 .. n - 1] (\_ -> selfTransfer 0.01)
+  afterSplit <- accountHoldings w.underlying account
+  -- (c2): n allocations chained through change, from one holding.
+  start <- largest
+  probe <- submit w.operator $ createCmd ChainProbe with operator = w.operator
+  chainTree <- submitTree (actAs w.operator <> disclose ud) $ exerciseCmd probe ChainProbe_Allocate with
+    factory = toInterfaceContractId w.underlying.rules; admin = w.underlying.admin
+    instrumentId = (underlyingInstrument w.underlying).id; receiver = basicAccount (head w.requesters)
+    amounts = replicate n 0.01; inputs = [start]; deadline = addRelTime now (days 1)
+    extraArgs = underlyingArgs w.underlying
+  pure $ T.intercalate " "
+    [ "n=" <> show n
+    , "holdingsAfterDeposits=" <> show (length afterDeposits)
+    , "holdingsAfterOneRedemptionNamingAll=" <> show (length afterRedeem)
+    , "selfTransferNodes=" <> show splitNodes
+    , "holdingsAfterSplits=" <> show (length afterSplit)
+    , "chainedAllocationsFromOneHolding=" <> show n
+    , "chainNodes=" <> show (length (S.flatten chainTree.rootEvents)) ]

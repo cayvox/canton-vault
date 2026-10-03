@@ -1,0 +1,657 @@
+-- | Share registry tests: allocations, settlement, cancellation and
+-- withdrawal (`docs/REGISTRY-MUSTS.md`, sections 3 to 5, 7 and 8).
+module Cayvox.VaultV1Test.Allocations where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import qualified DA.Map as Map
+import DA.Optional (fromSome, isNone, isSome)
+import qualified DA.TextMap as TextMap
+import DA.Time (addRelTime, microseconds, seconds)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard
+import Cayvox.VaultV1Test.Setup
+
+-- | Alice with `amount` shares, and Bob.
+withShares : Text -> Decimal -> Script (Registry, Party, Party, ContractId Holding)
+withShares tag amount = do
+  reg <- setupRegistry tag
+  alice <- allocateParty ("alice-" <> tag)
+  bob <- allocateParty ("bob-" <> tag)
+  h <- mintShares reg alice amount tag
+  pure (reg, alice, bob, h)
+
+-- | A settlement of `amount` shares from Alice to Bob: its leg and both
+-- allocations.
+aliceToBob : Registry -> Party -> Party -> ContractId Holding -> Decimal -> Text -> Optional Time -> Bool
+  -> Script (SettlementInfo, TransferLeg, ContractId Allocation, ContractId Allocation)
+aliceToBob reg alice bob h amount id deadline committed = do
+  let settlement = settlementOf reg id
+      leg = shareLeg reg "l1" (basicAccount alice) (basicAccount bob) amount
+  (send, _) <- allocate reg [alice] settlement (specOf reg (basicAccount alice) [senderSide leg] deadline committed) [h]
+  (recv, _) <- allocate reg [bob] settlement (specOf reg (basicAccount bob) [receiverSide leg] deadline False) []
+  pure (settlement, leg, send, recv)
+
+-- Mint and burn (RM-49)
+------------------------
+
+-- | A settlement from `cip-112/mint` creates the receiver's shares.
+test_settleBatch_mintCreatesShares : Script ()
+test_settleBatch_mintCreatesShares = do
+  (reg, alice, _, _) <- withShares "mint" 100.0
+  b <- balanceOf reg alice
+  b === (100.0, 0.0)
+
+-- | A settlement to `cip-112/burn` destroys the sender's shares.
+test_settleBatch_burnDestroysShares : Script ()
+test_settleBatch_burnDestroysShares = do
+  (reg, alice, _, h) <- withShares "burn" 100.0
+  let settlement = settlementOf reg "burn"
+      leg = shareLeg reg "b" (basicAccount alice) burnAccount 40.0
+  (send, change) <- allocate reg [alice] settlement (specOf reg (basicAccount alice) [senderSide leg] None False) [h]
+  (burn, _) <- allocate reg [reg.operator] settlement (specOf reg burnAccount [receiverSide leg] None False) []
+  _ <- settle reg settlement [leg] [send, burn]
+  b <- balanceOf reg alice
+  b === (60.0, 0.0)
+  length change === 1
+
+-- | A mint account only sends and a burn account only receives.
+test_allocate_rejectsMintReceiverSide : Script ()
+test_allocate_rejectsMintReceiverSide = do
+  reg <- setupRegistry "mint-side"
+  alice <- allocateParty "alice-mint-side"
+  let leg = shareLeg reg "m" (basicAccount alice) mintAccount 1.0
+      burnLeg = shareLeg reg "b" burnAccount (basicAccount alice) 1.0
+  tryAllocate reg [reg.operator] (settlementOf reg "s") (specOf reg mintAccount [receiverSide leg] None False) []
+    >>= assertFails (registry "invalid-account")
+  tryAllocate reg [reg.operator] (settlementOf reg "s") (specOf reg burnAccount [senderSide burnLeg] None False) []
+    >>= assertFails (registry "invalid-account")
+
+-- | Only the two special accounts of CIP-0112 are accepted without an owner.
+test_allocate_rejectsOtherSpecialAccount : Script ()
+test_allocate_rejectsOtherSpecialAccount = do
+  reg <- setupRegistry "special"
+  alice <- allocateParty "alice-special"
+  let other = Account with owner = None; provider = None; id = "cip-112/other"
+      leg = shareLeg reg "o" other (basicAccount alice) 1.0
+  res <- tryAllocate reg [reg.operator] (settlementOf reg "s") (specOf reg other [senderSide leg] None False) []
+  assertFails (registry "invalid-account") res
+  assertRejectsWrong (registry "wrong-admin") res
+  -- the operator is never a regular account holder (T-13)
+  let own = basicAccount reg.operator
+      ownLeg = shareLeg reg "o" mintAccount own 1.0
+  tryAllocate reg [reg.operator] (settlementOf reg "s") (specOf reg own [receiverSide ownLeg] None False) []
+    >>= assertFails (registry "invalid-account")
+
+-- Allocation factory (RM-40 to RM-42)
+--------------------------------------
+
+-- | The allocation's admin must be the factory's (RM-40).
+test_allocate_rejectsAnotherAdmin : Script ()
+test_allocate_rejectsAnotherAdmin = do
+  (reg, alice, bob, h) <- withShares "admin" 10.0
+  let leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+      spec = (specOf reg (basicAccount alice) [senderSide leg] None False) with admin = bob
+  res <- tryAllocate reg [alice] (settlementOf reg "s") spec [h]
+  assertFails (registry "wrong-admin") res
+  assertRejectsWrong (registry "unauthorized-actors") res
+
+-- | Only the authorizer's principal, alone or with the provider, allocates
+-- (RM-42).
+test_allocate_failsForUnauthorizedActors : Script ()
+test_allocate_failsForUnauthorizedActors = do
+  (reg, alice, bob, h) <- withShares "actors" 10.0
+  let leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+      spec = specOf reg (basicAccount alice) [senderSide leg] None False
+  tryAllocate reg [bob] (settlementOf reg "s") spec [h] >>= assertFails (registry "unauthorized-actors")
+  tryAllocate reg [alice, bob] (settlementOf reg "s") spec [h] >>= assertFails (registry "unauthorized-actors")
+  -- the admin is not the principal of a regular account
+  tryAllocate reg [reg.operator] (settlementOf reg "s") spec [h] >>= assertFails (registry "unauthorized-actors")
+
+-- | A provider alone cannot allocate: providers observe, they do not hold
+-- the owner's authority (RM-42).
+test_allocate_providerAloneCannotAllocate : Script ()
+test_allocate_providerAloneCannotAllocate = do
+  reg <- setupRegistry "provider-alloc"
+  alice <- allocateParty "alice-provider-alloc"
+  prov <- allocateParty "provider-alloc"
+  bob <- allocateParty "bob-provider-alloc"
+  let acct = Account with owner = Some alice; provider = Some prov; id = ""
+      leg = shareLeg reg "l" (basicAccount bob) acct 1.0
+      spec = specOf reg acct [receiverSide leg] None False
+  tryAllocate reg [prov] (settlementOf reg "s") spec [] >>= assertFails (registry "unauthorized-actors")
+  _ <- allocate reg [alice, prov] (settlementOf reg "s") spec []
+  _ <- allocate reg [alice] (settlementOf reg "s2") spec []
+  pure ()
+
+-- | Change is returned (RM-41).
+test_allocate_returnsChange : Script ()
+test_allocate_returnsChange = do
+  (reg, alice, bob, h) <- withShares "change" 10.0
+  (_, _, _, _) <- aliceToBob reg alice bob h 3.0 "s" None False
+  b <- balanceOf reg alice
+  b === (7.0, 3.0)
+
+-- | Input holdings not needed for funding are returned untouched (RM-41).
+test_allocate_returnsUnusedInputs : Script ()
+test_allocate_returnsUnusedInputs = do
+  (reg, alice, bob, h) <- withShares "unused" 10.0
+  let leg = shareLeg reg "l" (basicAccount bob) (basicAccount alice) 1.0
+  (_, returned) <- allocate reg [alice] (settlementOf reg "s") (specOf reg (basicAccount alice) [receiverSide leg] None False) [h]
+  returned === [h]
+  assertActive alice (fromInterfaceContractId @ShareHolding h)
+
+-- | An allocation that needs no funding validates its
+-- inputs too, so it never returns another owner's holdings as the
+-- authorizer's change (RM-41).
+test_allocate_refusesForeignUnusedInputs : Script ()
+test_allocate_refusesForeignUnusedInputs = do
+  (reg, alice, bob, h) <- withShares "unused-foreign" 10.0
+  let leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+  aliceHolding <- queryDisclosure alice (fromInterfaceContractId @ShareHolding h)
+  tryAllocateWith reg [bob] [fromSome aliceHolding] (settlementOf reg "s") (specOf reg (basicAccount bob) [receiverSide leg] None False) [h]
+    >>= assertFails (registry "invalid-input-holding")
+  assertActive alice (fromInterfaceContractId @ShareHolding h)
+
+-- | A sending allocation holds its funds in a holding locked by the admin
+-- alone (RM-05).
+test_allocate_locksFundingHolding : Script ()
+test_allocate_locksFundingHolding = do
+  (reg, alice, bob, h) <- withShares "lock" 10.0
+  (_, _, send, _) <- aliceToBob reg alice bob h 4.0 "s" None False
+  Some v <- queryInterfaceContractId alice send
+  case v.holdingCids of
+    [locked] -> do
+      Some lv <- queryInterfaceContractId alice locked
+      lv.amount === 4.0
+      (fromSome lv.lock).holders === [reg.operator]
+    other -> abort ("expected one locked holding, got " <> show other)
+
+-- | Iterated settlement is not supported (RM-22, D-07).
+test_allocate_rejectsIteratedSettlement : Script ()
+test_allocate_rejectsIteratedSettlement = do
+  (reg, alice, bob, h) <- withShares "iter" 10.0
+  let leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+      spec = (specOf reg (basicAccount alice) [senderSide leg] None False) with nextIterationFunding = Some TextMap.empty
+  tryAllocate reg [alice] (settlementOf reg "s") spec [h] >>= assertFails (registry "iterated-settlement")
+
+-- | The allocation view: no expiry, no original allocation (RM-31, RM-32).
+test_allocate_viewHasNoExpiry : Script ()
+test_allocate_viewHasNoExpiry = do
+  (reg, alice, bob, h) <- withShares "view" 10.0
+  (_, _, send, _) <- aliceToBob reg alice bob h 1.0 "s" None False
+  Some v <- queryInterfaceContractId alice send
+  check "expiresAt is set" (isNone v.expiresAt)
+  check "originalAllocationCid is set" (isNone v.originalAllocationCid)
+  v.numIterations === 0
+  Map.lookup AA_Cancel v.availableActions === Some [[reg.operator]]
+
+-- | The executors observe the allocation (RM-50).
+test_allocate_executorsObserveAllocation : Script ()
+test_allocate_executorsObserveAllocation = do
+  (reg, alice, bob, h) <- withShares "observe" 10.0
+  executor <- allocateParty "executor-observe"
+  let settlement = SettlementInfo with executors = [executor]; id = "s"; cid = None; meta = emptyMetadata
+      leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+  (send, _) <- allocate reg [alice] settlement (specOf reg (basicAccount alice) [senderSide leg] None False) [h]
+  seen <- queryInterfaceContractId executor send
+  check "the executor does not see the allocation" (isSome seen)
+
+-- | An allocation with 25 leg sides is supported; 26 exceed the bound (RM-55).
+test_allocate_supports25Legs : Script ()
+test_allocate_supports25Legs = do
+  (reg, alice, bob, h) <- withShares "legs25" 100.0
+  let legs n = [ shareLeg reg ("l" <> show i) (basicAccount alice) (basicAccount bob) 1.0 | i <- [1 .. n] ]
+  _ <- allocate reg [alice] (settlementOf reg "s") (specOf reg (basicAccount alice) (map senderSide (legs 25)) None False) [h]
+  pure ()
+
+test_allocate_rejects26Legs : Script ()
+test_allocate_rejects26Legs = do
+  (reg, alice, bob, h) <- withShares "legs26" 100.0
+  let legs = [ shareLeg reg ("l" <> show i) (basicAccount alice) (basicAccount bob) 1.0 | i <- [1 .. 26] ]
+  tryAllocate reg [alice] (settlementOf reg "s") (specOf reg (basicAccount alice) (map senderSide legs) None False) [h]
+    >>= assertFails (registry "field-too-large")
+
+-- Allocation guards, in the order of `allocateImpl`. Each test fails one
+-- guard, then shows that the valid allocation is created.
+----------------------------------------------------------------------------
+
+-- | Alice's shares, Bob, a sending leg of 1.0 and its allocation.
+data AllocFixture = AllocFixture with
+  reg : Registry
+  alice : Party
+  bob : Party
+  h : ContractId Holding
+  now : Time
+  leg : TransferLeg
+  spec : AllocationSpecification
+  s : SettlementInfo
+
+allocFixture : Text -> Script AllocFixture
+allocFixture tag = do
+  (reg, alice, bob, h) <- withShares tag 10.0
+  now <- getTime
+  let leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+  pure AllocFixture with
+    reg; alice; bob; h; now; leg
+    spec = specOf reg (basicAccount alice) [senderSide leg] None False
+    s = settlementOf reg "s"
+
+-- | Alice's allocation with the given specification fails with `name`; the
+-- fixture's valid allocation is then created.
+allocFails : AllocFixture -> Text -> AllocationSpecification -> Script ()
+allocFails f name spec = do
+  tryAllocate f.reg [f.alice] f.s spec [f.h] >>= assertFails (registry name)
+  allocationCreated f
+
+allocationCreated : AllocFixture -> Script ()
+allocationCreated f = allocate f.reg [f.alice] f.s f.spec [f.h] >> pure ()
+
+-- | `requestedAt` one unit in the future fails; the ledger time is accepted.
+test_allocate_failsWhenRequestedInFuture : Script ()
+test_allocate_failsWhenRequestedInFuture = do
+  f <- allocFixture "a-requested"
+  d <- rulesDisclosure f.reg
+  let tryAt requestedAt = trySubmit (actAs f.alice <> disclose d) $
+        exerciseCmd (toInterfaceContractId @AllocationFactory f.reg.rules) AllocationFactory_Allocate with
+          settlement = f.s; allocation = f.spec; requestedAt; inputHoldingCids = [f.h]; extraArgs = noArgs; actors = [f.alice]
+  tryAt (addRelTime f.now (microseconds 1)) >>= assertFails (registry "not-yet-requested")
+  tryAt f.now >>= either (abort . show) (const (pure ()))
+
+-- | No leg side.
+test_allocate_rejectsNoLegs : Script ()
+test_allocate_rejectsNoLegs = do
+  f <- allocFixture "a-nolegs"
+  allocFails f "no-transfer-legs" (f.spec with transferLegSides = [])
+
+-- | A non-positive leg amount.
+test_allocate_rejectsNonPositiveAmount : Script ()
+test_allocate_rejectsNonPositiveAmount = do
+  f <- allocFixture "a-amount"
+  allocFails f "invalid-amount" (f.spec with transferLegSides = [senderSide f.leg with amount = 0.0])
+
+-- | A leg side of another instrument.
+test_allocate_rejectsLegOfAnotherInstrument : Script ()
+test_allocate_rejectsLegOfAnotherInstrument = do
+  f <- allocFixture "a-instr"
+  allocFails f "wrong-instrument" (f.spec with transferLegSides = [senderSide f.leg with instrumentId = "other"])
+
+-- | The same leg side twice.
+test_allocate_rejectsDuplicateLegSide : Script ()
+test_allocate_rejectsDuplicateLegSide = do
+  f <- allocFixture "a-dup"
+  allocFails f "duplicate-leg" (f.spec with transferLegSides = [senderSide f.leg, senderSide f.leg])
+
+-- | A leg whose other side is the operator's own account.
+test_allocate_rejectsInvalidOtherSide : Script ()
+test_allocate_rejectsInvalidOtherSide = do
+  f <- allocFixture "a-otherside"
+  allocFails f "invalid-account" (f.spec with transferLegSides = [senderSide (f.leg with receiver = basicAccount f.reg.operator)])
+
+-- | A settlement deadline at the ledger time fails; one unit later is
+-- accepted.
+test_allocate_failsWhenDeadlinePassed : Script ()
+test_allocate_failsWhenDeadlinePassed = do
+  f <- allocFixture "a-deadline"
+  tryAllocate f.reg [f.alice] f.s (f.spec with settlementDeadline = Some f.now) [f.h] >>= assertFails (registry "deadline-passed")
+  allocate f.reg [f.alice] f.s (f.spec with settlementDeadline = Some (addRelTime f.now (microseconds 1))) [f.h] >> pure ()
+
+-- | An input holding of another instrument of the same operator, in
+-- Alice's account.
+test_allocate_rejectsInputOfAnotherInstrument : Script ()
+test_allocate_rejectsInputOfAnotherInstrument = do
+  f <- allocFixture "a-input-instr"
+  other <- otherInstrument f.reg
+  oh <- mintShares other f.alice 5.0 "a-input-instr-other"
+  tryAllocate f.reg [f.alice] f.s f.spec [oh] >>= assertFails (registry "invalid-input-holding")
+  allocationCreated f
+
+-- | Inputs that do not cover the amount; the exact amount succeeds with no
+-- change.
+test_allocate_failsForInsufficientFunds : Script ()
+test_allocate_failsForInsufficientFunds = do
+  f <- allocFixture "a-funds"
+  tryAllocate f.reg [f.alice] f.s (f.spec with transferLegSides = [senderSide f.leg with amount = 10.0000000001]) [f.h]
+    >>= assertFails (registry "insufficient-funds")
+  tryAllocate f.reg [f.alice] f.s f.spec [] >>= assertFails (registry "insufficient-funds")
+  (_, change) <- allocate f.reg [f.alice] f.s (f.spec with transferLegSides = [senderSide f.leg with amount = 10.0]) [f.h]
+  change === []
+
+-- | An input holding of another account, disclosed to Alice.
+test_allocate_rejectsInputOfAnotherAccount : Script ()
+test_allocate_rejectsInputOfAnotherAccount = do
+  f <- allocFixture "a-input"
+  bh <- mintShares f.reg f.bob 5.0 "a-input-bob"
+  Some bobDisclosure <- queryDisclosure f.bob (fromInterfaceContractId @ShareHolding bh)
+  tryAllocateWith f.reg [f.alice] [bobDisclosure] f.s f.spec [bh] >>= assertFails (registry "invalid-input-holding")
+  allocationCreated f
+
+-- Settlement (RM-23 to RM-27, RM-33 to RM-39, RM-54)
+-----------------------------------------------------
+
+-- | A settlement moves the shares and consumes both allocations (RM-25).
+test_settleBatch_consumesAllocations : Script ()
+test_settleBatch_consumesAllocations = do
+  (reg, alice, bob, h) <- withShares "consume" 10.0
+  (s, leg, send, recv) <- aliceToBob reg alice bob h 4.0 "s" None False
+  _ <- settle reg s [leg] [send, recv]
+  assertArchived alice (fromInterfaceContractId @ShareAllocation send)
+  assertArchived bob (fromInterfaceContractId @ShareAllocation recv)
+  a <- balanceOf reg alice
+  b <- balanceOf reg bob
+  (a, b) === ((6.0, 0.0), (4.0, 0.0))
+
+-- | Results come in the order of the allocations (RM-39).
+test_settleBatch_resultsInAllocationOrder : Script ()
+test_settleBatch_resultsInAllocationOrder = do
+  (reg, alice, bob, h) <- withShares "order" 10.0
+  (s, leg, send, recv) <- aliceToBob reg alice bob h 4.0 "s" None False
+  res <- settle reg s [leg] [recv, send]
+  case map (\r -> TextMap.toList r.authorizerHoldingCids) res.allocationSettleResults of
+    [[(_, [received])], [(_, [])]] -> do
+      Some rv <- queryInterfaceContractId bob received
+      rv.amount === 4.0
+    other -> abort ("unexpected results " <> show other)
+
+-- | The settlement deadline, one unit before and at (RM-24).
+test_settleBatch_atDeadlineBoundary : Script ()
+test_settleBatch_atDeadlineBoundary = do
+  (reg, alice, bob, h) <- withShares "deadline" 10.0
+  now <- getTime
+  let deadline = addRelTime now (seconds 10)
+  (s1, l1, send1, recv1) <- aliceToBob reg alice bob h 1.0 "s1" (Some deadline) False
+  [(h2, _)] <- filter (\(_, x) -> isNone x.lock) <$> holdingsOf reg alice
+  (s2, l2, send2, recv2) <- aliceToBob reg alice bob (toInterfaceContractId h2) 1.0 "s2" (Some deadline) False
+  setTime (addRelTime deadline (microseconds (-1)))
+  _ <- settle reg s1 [l1] [send1, recv1]
+  setTime deadline
+  trySettle reg s2 [l2] [send2, recv2] >>= assertFails (registry "deadline-passed")
+
+-- Batch-level guards. Each test fails one guard, then shows that the valid
+-- batch settles.
+--------------------------------------------------------------------------
+
+-- | Alice's and Bob's allocations of a settlement of 4.0.
+data BatchFixture = BatchFixture with
+  reg : Registry
+  alice : Party
+  bob : Party
+  s : SettlementInfo
+  leg : TransferLeg
+  send : ContractId Allocation
+  recv : ContractId Allocation
+
+batchFixture : Text -> Script BatchFixture
+batchFixture tag = do
+  (reg, alice, bob, h) <- withShares tag 10.0
+  (s, leg, send, recv) <- aliceToBob reg alice bob h 4.0 "s" None False
+  pure BatchFixture with reg; alice; bob; s; leg; send; recv
+
+batchSettles : BatchFixture -> Script ()
+batchSettles f = settle f.reg f.s [f.leg] [f.send, f.recv] >> pure ()
+
+-- | No transfer leg (RM-33).
+test_settleBatch_rejectsNoLegs : Script ()
+test_settleBatch_rejectsNoLegs = do
+  f <- batchFixture "b-nolegs"
+  trySettle f.reg f.s [] [f.send, f.recv] >>= assertFails (registry "no-transfer-legs")
+  batchSettles f
+
+-- | A leg of another instrument (RM-34).
+test_settleBatch_rejectsLegOfAnotherInstrument : Script ()
+test_settleBatch_rejectsLegOfAnotherInstrument = do
+  f <- batchFixture "b-instr"
+  trySettle f.reg f.s [f.leg with instrumentId = "other"] [f.send, f.recv] >>= assertFails (registry "wrong-instrument")
+  batchSettles f
+
+-- | Allocations of another settlement (RM-35).
+test_settleBatch_rejectsOtherSettlement : Script ()
+test_settleBatch_rejectsOtherSettlement = do
+  f <- batchFixture "b-settlement"
+  trySettle f.reg (f.s with id = "other") [f.leg] [f.send, f.recv] >>= assertFails (registry "settlement-mismatch")
+  batchSettles f
+
+-- | A leg side no allocation authorizes (RM-36).
+test_settleBatch_rejectsMissingAuthorization : Script ()
+test_settleBatch_rejectsMissingAuthorization = do
+  f <- batchFixture "b-missing"
+  trySettle f.reg f.s [f.leg] [f.send] >>= assertFails (registry "missing-authorization")
+  batchSettles f
+
+-- | An allocated leg side no transfer leg uses (RM-37).
+test_settleBatch_rejectsSuperfluousAuthorization : Script ()
+test_settleBatch_rejectsSuperfluousAuthorization = do
+  f <- batchFixture "b-superfluous"
+  let extra = shareLeg f.reg "l2" (basicAccount f.alice) (basicAccount f.bob) 1.0
+  (recv2, _) <- allocate f.reg [f.bob] f.s (specOf f.reg (basicAccount f.bob) [receiverSide extra] None False) []
+  trySettle f.reg f.s [f.leg] [f.send, f.recv, recv2] >>= assertFails (registry "superfluous-authorization")
+  batchSettles f
+
+-- | A duplicate leg identifier, and the same allocation twice (RM-37).
+test_settleBatch_rejectsDuplicateLegIds : Script ()
+test_settleBatch_rejectsDuplicateLegIds = do
+  f <- batchFixture "b-dup"
+  trySettle f.reg f.s [f.leg, f.leg] [f.send, f.recv] >>= assertFails (registry "duplicate-leg")
+  trySettle f.reg f.s [f.leg] [f.send, f.recv, f.recv] >>= assertFails (registry "duplicate-leg")
+  batchSettles f
+
+-- | A non-positive leg amount.
+test_settleBatch_rejectsNonPositiveLegAmount : Script ()
+test_settleBatch_rejectsNonPositiveLegAmount = do
+  f <- batchFixture "b-amount"
+  trySettle f.reg f.s [f.leg with amount = 0.0] [f.send, f.recv] >>= assertFails (registry "invalid-amount")
+  batchSettles f
+
+-- | Actors other than the executors (RM-38).
+test_settleBatch_failsForNonExecutors : Script ()
+test_settleBatch_failsForNonExecutors = do
+  f <- batchFixture "b-actors"
+  trySettleAs f.reg [f.alice] f.s [f.leg] (map nonIteratedAllocation [f.send, f.recv]) >>= assertFails (registry "unauthorized-actors")
+  batchSettles f
+
+-- | Extra leg sides without iterated settlement (RM-23).
+test_settleBatch_rejectsExtraLegSides : Script ()
+test_settleBatch_rejectsExtraLegSides = do
+  f <- batchFixture "b-extra"
+  let extra = shareLeg f.reg "l2" (basicAccount f.alice) (basicAccount f.bob) 1.0
+  trySettleAs f.reg [f.reg.operator] f.s [f.leg]
+    (map (\a -> (nonIteratedAllocation a) with extraTransferLegSides = [receiverSide extra]) [f.send, f.recv])
+    >>= assertFails (registry "iterated-settlement")
+  batchSettles f
+
+-- | Next-iteration funding without iterated settlement (RM-23).
+test_settleBatch_rejectsNextIterationFunding : Script ()
+test_settleBatch_rejectsNextIterationFunding = do
+  f <- batchFixture "b-funding"
+  trySettleAs f.reg [f.reg.operator] f.s [f.leg]
+    (map (\a -> (nonIteratedAllocation a) with nextIterationFunding = Some TextMap.empty) [f.send, f.recv])
+    >>= assertFails (registry "iterated-settlement")
+  batchSettles f
+
+-- | A settlement whose executor is not the operator: the executor settles
+-- the batch, and each allocation is settled by the operator with the
+-- executor (RM-26, RM-38).
+test_settleBatch_withExecutorOtherThanOperator : Script ()
+test_settleBatch_withExecutorOtherThanOperator = do
+  (reg, alice, bob, h) <- withShares "b-executor" 10.0
+  executor <- allocateParty "executor-b-executor"
+  let s = (settlementOf reg "s") with executors = [executor]
+      leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 4.0
+  (send, _) <- allocate reg [alice] s (specOf reg (basicAccount alice) [senderSide leg] None False) [h]
+  (recv, _) <- allocate reg [bob] s (specOf reg (basicAccount bob) [receiverSide leg] None False) []
+  trySettleAs reg [executor] s [leg] (map nonIteratedAllocation [send, recv]) >>= either (abort . show) (const (pure ()))
+  balanceOf reg bob >>= (=== (4.0, 0.0))
+
+-- | An allocation of another instrument of the same operator is rejected.
+test_settleBatch_rejectsAllocationOfAnotherInstrument : Script ()
+test_settleBatch_rejectsAllocationOfAnotherInstrument = do
+  (reg, alice, bob, h) <- withShares "instr" 10.0
+  other <- submit reg.operator $ createCmd ShareRules with
+    admin = reg.operator; instrumentId = (reg.instrument with id = "vault-other"); meta = emptyMetadata
+  let otherReg = reg with rules = other; instrument = (reg.instrument with id = "vault-other")
+  (s, leg, send, recv) <- aliceToBob reg alice bob h 1.0 "s" None False
+  trySettle otherReg s [leg with instrumentId = "vault-other"] [send, recv] >>= assertFails (registry "wrong-instrument")
+
+-- | Settlement with 25 legs and 50 allocations over 50 accounts (RM-54).
+test_settleBatch_supports25Legs50Allocations : Script ()
+test_settleBatch_supports25Legs50Allocations = do
+  reg <- setupRegistry "limits"
+  senders <- forA [1 .. 25] (\i -> allocateParty ("sender-limits-" <> show i))
+  receivers <- forA [1 .. 25] (\i -> allocateParty ("receiver-limits-" <> show i))
+  holdings <- forA (zip [1 .. 25] senders) (\(i, p) -> mintShares reg p 1.0 ("limits-" <> show i))
+  let s = settlementOf reg "s"
+      legs = [ shareLeg reg ("l" <> show i) (basicAccount a) (basicAccount b) 1.0 | (i, a, b) <- zip3 [1 .. 25] senders receivers ]
+  sends <- forA (zip3 senders legs holdings) $ \(p, l, h) ->
+    fst <$> allocate reg [p] s (specOf reg (basicAccount p) [senderSide l] None False) [h]
+  recvs <- forA (zip receivers legs) $ \(p, l) ->
+    fst <$> allocate reg [p] s (specOf reg (basicAccount p) [receiverSide l] None False) []
+  res <- settle reg s legs (sends ++ recvs)
+  length res.allocationSettleResults === 50
+  forA_ receivers $ \p -> do
+    b <- balanceOf reg p
+    b === (1.0, 0.0)
+
+-- Allocation choices (RM-25 to RM-30)
+--------------------------------------
+
+-- | An allocation of Alice's settled directly with `Allocation_Settle`.
+directSettle : Text -> Script (Party, Party, ContractId Allocation, TransferLeg)
+directSettle tag = do
+  (reg, alice, bob, h) <- withShares tag 10.0
+  executor <- allocateParty ("executor-" <> tag)
+  let settlement = SettlementInfo with executors = [executor]; id = "s"; cid = None; meta = emptyMetadata
+      leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+  (send, _) <- allocate reg [alice] settlement (specOf reg (basicAccount alice) [senderSide leg] None False) [h]
+  pure (reg.operator, executor, send, leg)
+
+settleWith : [Party] -> [TransferLegSide] -> Optional (TextMap.TextMap Decimal) -> ContractId Allocation
+  -> Script (Either SubmitError AllocationResult)
+settleWith actors extra funding cid = trySubmit (actAs actors) $ exerciseCmd cid Allocation_Settle with
+  actors; extraTransferLegSides = extra; nextIterationFunding = funding; extraArgs = noArgs
+
+-- | Settle requires the admin and the executors together (RM-26); the
+-- helper rejects another identifier for the same failure.
+test_settleAllocation_failsForExecutorsWithoutAdmin : Script ()
+test_settleAllocation_failsForExecutorsWithoutAdmin = do
+  (operator, executor, send, _) <- directSettle "sa-actors"
+  res <- settleWith [executor] [] None send
+  assertFails (registry "unauthorized-actors") res
+  assertRejectsWrong (registry "iterated-settlement") res
+  settleWith [executor, operator] [] None send >>= either (abort . show) (const (pure ()))
+
+-- | Settle rejects extra leg sides (RM-27).
+test_settleAllocation_rejectsExtraLegSides : Script ()
+test_settleAllocation_rejectsExtraLegSides = do
+  (operator, executor, send, leg) <- directSettle "sa-extra"
+  settleWith [executor, operator] [receiverSide leg] None send >>= assertFails (registry "iterated-settlement")
+  settleWith [executor, operator] [] None send >>= either (abort . show) (const (pure ()))
+
+-- | Settle rejects next-iteration funding (RM-27).
+test_settleAllocation_rejectsNextIterationFunding : Script ()
+test_settleAllocation_rejectsNextIterationFunding = do
+  (operator, executor, send, _) <- directSettle "sa-funding"
+  settleWith [executor, operator] [] (Some TextMap.empty) send >>= assertFails (registry "iterated-settlement")
+  settleWith [executor, operator] [] None send >>= either (abort . show) (const (pure ()))
+
+-- | Cancel: the executors only; it releases the locked funds and consumes
+-- the allocation (RM-25, RM-28).
+test_cancelAllocation_consumesAllocation : Script ()
+test_cancelAllocation_consumesAllocation = do
+  (reg, alice, bob, h) <- withShares "cancel" 10.0
+  (_, _, send, _) <- aliceToBob reg alice bob h 4.0 "s" None False
+  res <- trySubmit reg.operator $ exerciseCmd send Allocation_Cancel with actors = [reg.operator]; extraArgs = noArgs
+  case res of
+    Right r -> r.output === AllocationResult_Cancelled
+    Left e -> abort (show e)
+  assertArchived alice (fromInterfaceContractId @ShareAllocation send)
+  balanceOf reg alice >>= (=== (10.0, 0.0))
+
+-- | Withdraw: the authorizer's owner or provider; it releases the funds and
+-- consumes the allocation (RM-25, RM-30).
+test_withdrawAllocation_consumesAllocation : Script ()
+test_withdrawAllocation_consumesAllocation = do
+  (reg, alice, bob, h) <- withShares "withdraw" 10.0
+  (_, _, send, _) <- aliceToBob reg alice bob h 4.0 "s" None False
+  res <- trySubmit alice $ exerciseCmd send Allocation_Withdraw with actors = [alice]; extraArgs = noArgs
+  case res of
+    Right r -> r.output === AllocationResult_Withdrawn
+    Left e -> abort (show e)
+  assertArchived alice (fromInterfaceContractId @ShareAllocation send)
+  balanceOf reg alice >>= (=== (10.0, 0.0))
+
+-- | Cancel: not the authorizer, nor the admin with the executors (RM-28).
+test_cancelAllocation_failsForAuthorizer : Script ()
+test_cancelAllocation_failsForAuthorizer = do
+  (reg, alice, bob, h) <- withShares "cancel-actors" 10.0
+  executor <- allocateParty "executor-cancel"
+  let settlement = (settlementOf reg "s") with executors = [executor]
+      leg = shareLeg reg "l" (basicAccount alice) (basicAccount bob) 1.0
+  (send, _) <- allocate reg [alice] settlement (specOf reg (basicAccount alice) [senderSide leg] None False) [h]
+  let cancelBy actors = trySubmit (actAs actors) $ exerciseCmd send Allocation_Cancel with actors; extraArgs = noArgs
+  cancelBy [alice] >>= assertFails (registry "unauthorized-actors")
+  cancelBy [executor, reg.operator] >>= assertFails (registry "unauthorized-actors")
+  cancelBy [executor] >>= either (abort . show) (const (pure ()))
+
+-- | Withdraw: not the admin, nor an outsider with the owner (RM-30).
+test_withdrawAllocation_failsForUnauthorizedActors : Script ()
+test_withdrawAllocation_failsForUnauthorizedActors = do
+  (reg, alice, bob, h) <- withShares "withdraw-actors" 10.0
+  (_, _, send, _) <- aliceToBob reg alice bob h 4.0 "s" None False
+  let withdrawBy actors = trySubmit (actAs actors) $ exerciseCmd send Allocation_Withdraw with actors; extraArgs = noArgs
+  withdrawBy [reg.operator] >>= assertFails (registry "unauthorized-actors")
+  withdrawBy [alice, bob] >>= assertFails (registry "unauthorized-actors")
+  withdrawBy [alice] >>= either (abort . show) (const (pure ()))
+
+-- | A provider may withdraw its account's allocation (RM-30).
+test_withdrawAllocation_byProvider : Script ()
+test_withdrawAllocation_byProvider = do
+  reg <- setupRegistry "withdraw-prov"
+  alice <- allocateParty "alice-withdraw-prov"
+  prov <- allocateParty "provider-withdraw"
+  bob <- allocateParty "bob-withdraw-prov"
+  let acct = Account with owner = Some alice; provider = Some prov; id = ""
+      leg = shareLeg reg "l" (basicAccount bob) acct 1.0
+  (recv, _) <- allocate reg [alice] (settlementOf reg "s") (specOf reg acct [receiverSide leg] None False) []
+  _ <- submit prov $ exerciseCmd recv Allocation_Withdraw with actors = [prov]; extraArgs = noArgs
+  pure ()
+
+-- | A committed allocation: withdrawal fails before and at the deadline and
+-- succeeds after it (RM-29).
+test_withdrawAllocation_committedAtDeadlineBoundary : Script ()
+test_withdrawAllocation_committedAtDeadlineBoundary = do
+  (reg, alice, bob, h) <- withShares "committed" 10.0
+  now <- getTime
+  let deadline = addRelTime now (seconds 10)
+  (_, _, send, _) <- aliceToBob reg alice bob h 4.0 "s" (Some deadline) True
+  let withdraw = trySubmit alice $ exerciseCmd send Allocation_Withdraw with actors = [alice]; extraArgs = noArgs
+  withdraw >>= assertFails (registry "committed-allocation")
+  setTime deadline
+  withdraw >>= assertFails (registry "committed-allocation")
+  setTime (addRelTime deadline (microseconds 1))
+  withdraw >>= either (\e -> abort (show e)) (const (pure ()))
+
+-- | A committed allocation without a settlement deadline is refused; with a
+-- deadline, or uncommitted without one, it is created.
+test_allocate_rejectsCommittedWithoutDeadline : Script ()
+test_allocate_rejectsCommittedWithoutDeadline = do
+  f <- allocFixture "a-committed"
+  tryAllocate f.reg [f.alice] f.s (f.spec with committed = True; settlementDeadline = None) [f.h]
+    >>= assertFails (registry "committed-without-deadline")
+  allocate f.reg [f.alice] f.s (f.spec with committed = True; settlementDeadline = Some (addRelTime f.now (seconds 10))) [f.h]
+  h2 <- largestUnlocked f.reg f.alice
+  allocate f.reg [f.alice] (f.s with id = "s2") (f.spec with committed = False; settlementDeadline = None) [h2]
+  pure ()
+
+-- | The helper rejects a failure of another identifier.
+assertRejectsWrong : Expected -> Either SubmitError a -> Script ()
+assertRejectsWrong wrong res = case res of
+  Left err | matches wrong err -> abort ("the helper accepted " <> show wrong)
+  _ -> pure ()

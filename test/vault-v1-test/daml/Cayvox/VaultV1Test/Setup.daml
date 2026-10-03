@@ -1,0 +1,249 @@
+-- | Fixtures for the share registry tests: a registry per test, shares
+-- minted through settlement, allocations, settlements and transfers as
+-- submissions, balances, and the facts of a transaction tree that the event
+-- tests check.
+module Cayvox.VaultV1Test.Setup where
+
+import DA.Fail (FailureCategory (..))
+import DA.Foldable (forA_)
+import DA.List (sortOn)
+import DA.Optional (fromSome, isNone, isSome)
+import qualified DA.TextMap as TextMap
+import DA.Time (RelTime, addRelTime)
+import Daml.Script
+
+import Splice.Api.Token.AllocationInstructionV2
+import Splice.Api.Token.AllocationV2
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.TransferEventsV2 as Events
+import Splice.Api.Token.TransferInstructionV2
+
+import Cayvox.Testing.Assert
+import Cayvox.VaultV1.Internal.ShareRegistry
+import Cayvox.VaultV1.Internal.TokenStandard
+
+-- | A share registry and its operator.
+data Registry = Registry with
+    operator : Party
+    rules : ContractId ShareRules
+    instrument : InstrumentId
+  deriving (Eq, Show)
+
+-- | A fresh registry whose operator is the instrument admin.
+setupRegistry : Text -> Script Registry
+setupRegistry tag = do
+  operator <- allocateParty ("operator-" <> tag)
+  let instrument = InstrumentId with admin = operator; id = "vault-" <> tag
+  rules <- submit operator $ createCmd ShareRules with admin = operator; instrumentId = instrument; meta = emptyMetadata
+  pure Registry with operator; rules; instrument
+
+-- | A second instrument of the same operator, with its own rules.
+otherInstrument : Registry -> Script Registry
+otherInstrument reg = do
+  let instrument = reg.instrument with id = reg.instrument.id <> "-other"
+  rules <- submit reg.operator $ createCmd ShareRules with admin = reg.operator; instrumentId = instrument; meta = emptyMetadata
+  pure reg with rules; instrument
+
+-- | The registry's failure with the given name.
+registry : Text -> Expected
+registry name = Status ("cayvox.com/registry-" <> name) InvalidGivenCurrentSystemStateOther
+
+-- | No choice context and no metadata.
+noArgs : ExtraArgs
+noArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+-- | A settlement executed by the operator.
+settlementOf : Registry -> Text -> SettlementInfo
+settlementOf reg id = SettlementInfo with executors = [reg.operator]; id; cid = None; meta = emptyMetadata
+
+-- | A transfer leg of the share instrument.
+shareLeg : Registry -> Text -> Account -> Account -> Decimal -> TransferLeg
+shareLeg reg transferLegId sender receiver amount = TransferLeg with
+  transferLegId; sender; receiver; amount; instrumentId = reg.instrument.id; meta = emptyMetadata
+
+-- | An allocation specification of the share instrument.
+specOf : Registry -> Account -> [TransferLegSide] -> Optional Time -> Bool -> AllocationSpecification
+specOf reg authorizer transferLegSides settlementDeadline committed = AllocationSpecification with
+  admin = reg.operator
+  authorizer
+  transferLegSides
+  settlementDeadline
+  nextIterationFunding = None
+  committed
+  meta = emptyMetadata
+
+-- | The rules contract as a disclosure, for parties that do not see it.
+rulesDisclosure : Registry -> Script Disclosure
+rulesDisclosure reg = fromSome <$> queryDisclosure reg.operator reg.rules
+
+-- | `AllocationFactory_Allocate`, submitted by the actors.
+tryAllocate : Registry -> [Party] -> SettlementInfo -> AllocationSpecification -> [ContractId Holding]
+  -> Script (Either SubmitError AllocationInstructionResult)
+tryAllocate reg actors settlement allocation inputHoldingCids =
+  tryAllocateWith reg actors [] settlement allocation inputHoldingCids
+
+-- | `AllocationFactory_Allocate` with extra disclosures.
+tryAllocateWith : Registry -> [Party] -> [Disclosure] -> SettlementInfo -> AllocationSpecification -> [ContractId Holding]
+  -> Script (Either SubmitError AllocationInstructionResult)
+tryAllocateWith reg actors extra settlement allocation inputHoldingCids = do
+  d <- rulesDisclosure reg
+  now <- getTime
+  trySubmit (actAs actors <> discloseMany (d :: extra)) $
+    exerciseCmd (toInterfaceContractId @AllocationFactory reg.rules) AllocationFactory_Allocate with
+      settlement; allocation; requestedAt = now; inputHoldingCids; extraArgs = noArgs; actors
+
+-- | A successful allocation.
+allocate : Registry -> [Party] -> SettlementInfo -> AllocationSpecification -> [ContractId Holding]
+  -> Script (ContractId Allocation, [ContractId Holding])
+allocate reg actors settlement allocation inputs = do
+  res <- tryAllocate reg actors settlement allocation inputs
+  case res of
+    Right AllocationInstructionResult {output = AllocationInstructionResult_Completed {allocationCid}, authorizerChangeCids} ->
+      pure (allocationCid, concatMap snd (TextMap.toList authorizerChangeCids))
+    _ -> abort ("allocation failed: " <> show res)
+
+-- | `SettlementFactory_SettleBatch`, submitted by the operator, the executor.
+trySettle : Registry -> SettlementInfo -> [TransferLeg] -> [ContractId Allocation]
+  -> Script (Either SubmitError SettlementFactory_SettleBatchResult)
+trySettle reg settlement transferLegs allocations = trySettleAs reg [reg.operator] settlement transferLegs (map nonIteratedAllocation allocations)
+
+-- | `SettlementFactory_SettleBatch` with given actors and finalized allocations.
+trySettleAs : Registry -> [Party] -> SettlementInfo -> [TransferLeg] -> [FinalizedAllocation]
+  -> Script (Either SubmitError SettlementFactory_SettleBatchResult)
+trySettleAs reg actors settlement transferLegs allocations = do
+  d <- rulesDisclosure reg
+  trySubmit (actAs actors <> disclose d) $
+    exerciseCmd (toInterfaceContractId @SettlementFactory reg.rules) SettlementFactory_SettleBatch with
+      settlement; transferLegs; allocations; actors; extraArgs = noArgs
+
+-- | A successful settlement.
+settle : Registry -> SettlementInfo -> [TransferLeg] -> [ContractId Allocation] -> Script SettlementFactory_SettleBatchResult
+settle reg settlement legs allocations = do
+  res <- trySettle reg settlement legs allocations
+  either (\e -> abort ("settlement failed: " <> show e)) pure res
+
+-- | Mint shares to an owner's basic account through a settlement from
+-- `cip-112/mint`; the settlement identifier must be unique per call.
+mintShares : Registry -> Party -> Decimal -> Text -> Script (ContractId Holding)
+mintShares reg owner amount tag = do
+  let settlement = settlementOf reg ("mint-" <> tag)
+      leg = shareLeg reg "mint" mintAccount (basicAccount owner) amount
+  (mintAllocation, _) <- allocate reg [reg.operator] settlement (specOf reg mintAccount [senderSide leg] None False) []
+  (receipt, _) <- allocate reg [owner] settlement (specOf reg (basicAccount owner) [receiverSide leg] None False) []
+  res <- settle reg settlement [leg] [mintAllocation, receipt]
+  case res.allocationSettleResults of
+    [_, receiptResult] -> case concatMap snd (TextMap.toList receiptResult.authorizerHoldingCids) of
+      [holding] -> pure holding
+      other -> abort ("mint: expected one holding, got " <> show other)
+    other -> abort ("mint: unexpected results " <> show other)
+
+-- | `TransferFactory_Transfer`, submitted by the actors.
+tryTransfer : Registry -> [Party] -> Account -> Account -> Decimal -> [ContractId Holding] -> RelTime
+  -> Script (Either SubmitError TransferInstructionResult)
+tryTransfer reg actors sender receiver amount inputHoldingCids validity = do
+  d <- rulesDisclosure reg
+  now <- getTime
+  trySubmit (actAs actors <> disclose d) $
+    exerciseCmd (toInterfaceContractId @TransferFactory reg.rules) TransferFactory_Transfer with
+      transfer = Transfer with
+        sender; receiver; amount; instrumentId = reg.instrument
+        requestedAt = now; executeBefore = addRelTime now validity
+        inputHoldingCids; meta = emptyMetadata
+      actors
+      extraArgs = noArgs
+
+-- | The share holdings of an account, as seen by its owner.
+holdingsOf : Registry -> Party -> Script [(ContractId ShareHolding, ShareHolding)]
+holdingsOf reg owner = do
+  all <- query @ShareHolding owner
+  pure (filter (\(_, h) -> h.instrumentId == reg.instrument && h.account.owner == Some owner) all)
+
+-- | The owner's largest unlocked holding; query order is not defined, so
+-- tests that need funds pick by amount.
+largestUnlocked : Registry -> Party -> Script (ContractId Holding)
+largestUnlocked reg owner = do
+  hs <- holdingsOf reg owner
+  case sortOn (\(_, h) -> negate h.amount) [ x | x@(_, h) <- hs, isNone h.lock ] of
+    (cid, _) :: _ -> pure (toInterfaceContractId cid)
+    [] -> abort ("no unlocked holding of " <> show owner)
+
+-- | The unlocked and locked shares of an owner.
+balanceOf : Registry -> Party -> Script (Decimal, Decimal)
+balanceOf reg owner = do
+  hs <- holdingsOf reg owner
+  let amounts locked = sum [ h.amount | (_, h) <- hs, isSome h.lock == locked ]
+  pure (amounts False, amounts True)
+
+-- | The total supply, as the sum of the given owners' holdings.
+supplyOf : Registry -> [Party] -> Script Decimal
+supplyOf reg owners = do
+  bs <- forA owners (balanceOf reg)
+  pure (sum [ u + l | (u, l) <- bs ])
+
+-- | Assert a condition.
+check : Text -> Bool -> Script ()
+check label cond = if cond then pure () else abort label
+
+-- Transaction facts
+--------------------
+
+-- | What a transaction did to share holdings and which events it reported.
+data TreeFacts = TreeFacts with
+    events : [Events.EventLog_HoldingsChange]
+    created : [(ContractId Holding, Account)]
+    archived : [ContractId Holding]
+  deriving (Eq, Show)
+
+-- | The share holdings created and archived and the events reported in a
+-- transaction tree.
+treeFacts : TransactionTree -> TreeFacts
+treeFacts tree = foldl step (TreeFacts [] [] []) (flatten tree.rootEvents)
+  where
+    step facts event = case event of
+      CreatedEvent c -> case fromAnyTemplate @ShareHolding c.argument of
+        Some h -> facts with created = facts.created ++ [(holdingCid c.contractId, h.account)]
+        None -> facts
+      ExercisedEvent e ->
+        case fromAnyChoice @Events.EventLog @Events.EventLog_HoldingsChange e.argument of
+          Some arg -> facts with events = facts.events ++ [arg]
+          None -> case (e.choice, fromAnyChoice @ShareHolding @Archive e.argument) of
+            ("Archive", Some _) -> facts with archived = facts.archived ++ [holdingCid e.contractId]
+            _ -> facts
+
+-- | A share holding's contract ID from a tree event.
+holdingCid : Daml.Script.AnyContractId -> ContractId Holding
+holdingCid any = toInterfaceContractId @Holding (fromSome (fromAnyContractId @ShareHolding any))
+
+flatten : [TreeEvent] -> [TreeEvent]
+flatten = concatMap $ \event -> case event of
+  ExercisedEvent e -> event :: flatten e.childEvents
+  _ -> [event]
+
+-- | Every share holding created or archived in the transaction appears in
+-- exactly one event with the operator as admin and, for a created holding,
+-- its own account; every event names only such holdings and includes the
+-- account parties among its observers (`TransferEventsV2.daml:57-95`;
+-- `[CIP112]:1246`).
+assertEventsExplain : Registry -> TransactionTree -> Script TreeFacts
+assertEventsExplain reg tree = do
+  let facts = treeFacts tree
+      inputs = concatMap (.inputHoldingCids) facts.events
+      outputs = concatMap (.outputHoldingCids) facts.events
+      eventFor cid = [ e | e <- facts.events, cid `elem` e.inputHoldingCids || cid `elem` e.outputHoldingCids ]
+  forA_ facts.created $ \(cid, account) -> case eventFor cid of
+    [e] -> check ("holding created in an event of another account: " <> show cid) (e.account == account)
+    es -> abort ("created holding " <> show cid <> " is in " <> show (length es) <> " events")
+  forA_ facts.archived $ \cid -> case eventFor cid of
+    [_] -> pure ()
+    es -> abort ("archived holding " <> show cid <> " is in " <> show (length es) <> " events")
+  check "an event names a holding the transaction did not create" (all (`elem` map fst facts.created) outputs)
+  check "an event names a holding the transaction did not archive" (all (`elem` facts.archived) inputs)
+  forA_ facts.events $ \e -> do
+    check "an event is reported by another admin" (e.admin == reg.operator)
+    check "an event's observers miss an account party" (all (`elem` e.observers) (accountParties reg.operator e.account))
+  pure facts
+
+-- | Sort events by account, for comparisons.
+eventsByAccount : [Events.EventLog_HoldingsChange] -> [Events.EventLog_HoldingsChange]
+eventsByAccount = sortOn (\e -> show e.account)
