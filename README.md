@@ -81,7 +81,13 @@ sequenceDiagram
 
 ## Verification
 
-Two runs back the figures below. The fast gates were run on this repository as published: style, token DAR pins, repository conventions and documentation, then the build and every unit and scenario test on each SDK of the matrix. [`docs/TESTING.md`](docs/TESTING.md) defines each gate. The longer suites come from the final full run of [`scripts/ci.sh`](scripts/ci.sh) at commit `feda338` of the development history, which is not part of this repository's history. Every figure can be reproduced with the linked script.
+Two runs back the figures below. The fast gates were run on this repository as published: style, token DAR pins, repository conventions and documentation, then the build and every unit and scenario test on each SDK of the matrix. [`docs/TESTING.md`](docs/TESTING.md) defines each gate. The other rows come from the final full run of [`scripts/ci.sh`](scripts/ci.sh), marked `feda338`. The longer suites ran on code that compiles to byte-identical packages, identical package IDs, to this release. Every figure can be reproduced with the linked script.
+
+| Package | Main package ID, SDK 3.4.11 | Main package ID, SDK 3.5.10 |
+|---|---|---|
+| `cvx-vault-math-v1` | `78c7b14a0b28b4b6087081e00eb97be2addf9b3826a5c84b72ca96295d94402c` | `2ff89013ab4db79aeab78a551ea72739570cb03220015d514a459c4085c373f9` |
+| `cvx-api-vault-v1` | `27fcecf990560c97dcef4dd7df8fc655b1348b8c569a3e911fab4de5f5b74656` | built by SDK 3.4.11 only |
+| `cvx-vault-v1` | `9ec3a301193141c421d286d0261d709aca04eeb053c79606160fbbed9b595737` | `6965f12bf9b976fb5cef77892dff99d96905610686a3948f4f2c89016506882a` |
 
 | Evidence | Result | Run | Reproduce |
 |---|---|---|---|
