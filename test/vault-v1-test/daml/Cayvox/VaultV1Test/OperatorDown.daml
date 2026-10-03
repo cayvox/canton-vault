@@ -7,9 +7,9 @@
 -- operator's participant, waits, submits the execution, and finally
 -- cancels the request. Run through `dpm script` with a participant
 -- configuration. Not a test: it takes an input.
-module Cayvox.VaultV1Test.R20
-  ( R20Input (..)
-  , probeR20
+module Cayvox.VaultV1Test.OperatorDown
+  ( OperatorDownInput (..)
+  , runOperatorDown
   ) where
 
 import DA.Time (convertRelTimeToMicroseconds, seconds, subTime)
@@ -23,7 +23,7 @@ import qualified Cayvox.VaultV1Test.Setup as S
 import Cayvox.VaultV1Test.Underlying
 import Cayvox.VaultV1Test.VaultSetup
 
-data R20Input = R20Input with
+data OperatorDownInput = OperatorDownInput with
     tag : Text
     operatorParticipant : Text
       -- ^ The participant that hosts the operator, as named in the
@@ -36,8 +36,8 @@ outcome : Either SubmitError a -> Text
 outcome (Right _) = "committed"
 outcome (Left e) = "refused: " <> show e
 
-probeR20 : R20Input -> Script [Text]
-probeR20 input = do
+runOperatorDown : OperatorDownInput -> Script [Text]
+runOperatorDown input = do
   let tag = input.tag
   underlying <- setupUnderlying ("underlying-" <> tag)
   operator <- allocatePartyOn ("operator-" <> tag) (ParticipantName input.operatorParticipant)

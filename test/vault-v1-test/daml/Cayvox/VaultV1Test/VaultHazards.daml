@@ -209,9 +209,9 @@ test_hazard_t11_operatorRewritesTotals = do
 
 -- | T-13: the operator mints shares outside any vault execution.
 -- Reconciliation detects it (I-02).
-test_hazard_r25_operatorMintsOutsideTheVault : Script ()
-test_hazard_r25_operatorMintsOutsideTheVault = do
-  w <- setupWorld "r25" Permissioned 0 1
+test_hazard_operatorMintOutsideExecution : Script ()
+test_hazard_operatorMintOutsideExecution = do
+  w <- setupWorld "mint-outside" Permissioned 0 1
   let [alice] = w.requesters
   j <- journaled w =<< depositAll w w.operator [(alice, 100.0, False)]
   reconcile w j >>= \r -> check ("honest state reconciles: " <> show r) (reconciles r)
@@ -308,11 +308,11 @@ viewOf v = VaultView with
 -- The in-memory ledger vets every package, so here it mints Mallory shares
 -- during an honest execution; on Canton the operator's participant runs
 -- only packages it has vetted. Reconciliation reports the mint (I-02).
-test_hazard_b07_forgedFactory : Script ()
-test_hazard_b07_forgedFactory = do
-  w <- setupWorld "b07" Permissioned 0 1
+test_hazard_foreignFactoryRunsWithVaultAuthority : Script ()
+test_hazard_foreignFactoryRunsWithVaultAuthority = do
+  w <- setupWorld "foreign-factory" Permissioned 0 1
   let [alice] = w.requesters
-  mallory <- allocateParty "mallory-b07"
+  mallory <- allocateParty "mallory-factory"
   forged <- submit mallory $ createCmd ForgedFactory with
     mallory; operator = w.operator; instrument = w.shares.instrument
     claimedAdmin = w.underlying.admin; real = toInterfaceContractId w.underlying.rules
@@ -359,9 +359,9 @@ test_hazard_t21_operatorSettlesInputAlone = do
 -- vault by archiving the state and creating it again with the new factory
 -- and every other field unchanged; reconciliation then still holds, and the
 -- vault executes again (`docs/SECURITY.md` §2, "Registry migration").
-test_hazard_b04_registryMigration : Script ()
-test_hazard_b04_registryMigration = do
-  w <- setupWorld "b04" Permissioned 0 1
+test_hazard_registryFactoryMigration : Script ()
+test_hazard_registryFactoryMigration = do
+  w <- setupWorld "factory-migration" Permissioned 0 1
   let [alice] = w.requesters
   j <- journaled w =<< depositAll w w.operator [(alice, 10.0, False)]
   -- The share registry replaces its rules contract.

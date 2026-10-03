@@ -5,11 +5,11 @@
 -- transaction reports the ledger time the vault compared with the deadline.
 -- Run on a sandbox through `dpm script`. Not a test: it takes an
 -- input.
-module Cayvox.VaultV1Test.R22
-  ( R22Input (..)
+module Cayvox.VaultV1Test.DeadlineClock
+  ( DeadlineClockInput (..)
   , ClockProbe (..)
   , ClockProbe_Now (..)
-  , probeR22
+  , runDeadlineClock
   ) where
 
 import qualified DA.Text as T
@@ -20,7 +20,7 @@ import Cayvox.VaultV1
 import Cayvox.VaultV1Test.VaultSetup
 
 -- | Offsets before the deadline in milliseconds (negative: after it).
-data R22Input = R22Input with
+data DeadlineClockInput = DeadlineClockInput with
     offsetsMillis : [Int]
     tag : Text
   deriving (Eq, Show)
@@ -42,8 +42,8 @@ millis n = convertMicrosecondsToRelTime (n * 1000)
 micros : RelTime -> Int
 micros = convertRelTimeToMicroseconds
 
-probeR22 : R22Input -> Script [Text]
-probeR22 input = do
+runDeadlineClock : DeadlineClockInput -> Script [Text]
+runDeadlineClock input = do
   w <- setupWorldWith ("r22-" <> input.tag) Permissioned 0 (length input.offsetsMillis) 100.0
   probe <- submit w.operator $ createCmd ClockProbe with owner = w.operator
   forA (zip w.requesters input.offsetsMillis) $ \(p, offset) -> do
