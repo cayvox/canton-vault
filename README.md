@@ -73,11 +73,11 @@ sequenceDiagram
 
 ## Trust model
 
-The operator signs the vault state, owns the vault's account at the underlying registry, and is the instrument admin of the shares.
-Through vault choices every amount is computed exactly, rounded in the vault's favour, and moved atomically with the accounting; a requester gets at least `minOut` or nothing moves.
-Outside vault choices the operator can move custody, rewrite the vault state, mint shares, and settle a pending request's input alone; the library cannot prevent this and makes it detectable by reconciliation.
-In Permissioned mode requests execute only when the operator acts; in Permissionless mode requesters execute their own, and the operator's participant must still confirm.
-[`docs/SECURITY.md`](docs/SECURITY.md) states each threat, its mitigation and the test that shows it, and the open questions before production use.
+- The operator signs the vault state, owns the vault's account at the underlying registry, and is the instrument admin of the shares.
+- Through vault choices every amount is computed exactly, rounded in the vault's favour, and moved atomically with the accounting; a requester gets at least `minOut` or nothing moves.
+- Outside vault choices the operator can move custody, rewrite the vault state, mint shares, and settle a pending request's input alone; the library cannot prevent this and makes it detectable by reconciliation.
+- In Permissioned mode requests execute only when the operator acts; in Permissionless mode requesters execute their own, and the operator's participant must still confirm.
+- [`docs/SECURITY.md`](docs/SECURITY.md) states each threat, its mitigation and the test that shows it, and the open questions before production use.
 
 ## Verification
 
