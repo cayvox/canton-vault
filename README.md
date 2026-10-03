@@ -7,7 +7,7 @@ An ERC-4626-style share vault for Canton, written in Daml, over one Canton Token
 
 ## What it is
 
-A vault holds one underlying instrument and issues shares against it, with ERC-4626 conversion and rounding: deposits mint shares rounded down, redemptions pay assets rounded down, and virtual shares and assets defend against inflation of the share price. Every deposit and redemption settles in one Daml transaction through the Canton Token Standard V2 allocation and settlement interfaces, so the underlying moves and the shares are minted or burned atomically, or nothing happens. The shares are themselves a Token Standard V2 token whose registry is part of the vault package, and the code follows the package layout and conventions of OpenZeppelin's [canton-contracts](https://github.com/OpenZeppelin/canton-contracts) library.
+A vault holds one underlying instrument and issues shares against it, with ERC-4626 conversion and rounding: deposits mint shares rounded down, redemptions pay assets rounded down, and virtual shares and assets defend against inflation of the share price. Every deposit and redemption settles in one Daml transaction through the Canton Token Standard V2 allocation and settlement interfaces, so the underlying moves and the shares are minted or burned atomically, or nothing happens. The shares are themselves a Token Standard V2 token whose registry is part of the vault package, and the code follows the [canton-contracts](https://github.com/OpenZeppelin/canton-contracts) conventions at `aeca01d`, with the differences listed in [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md).
 
 ## Packages
 
@@ -94,7 +94,7 @@ Two runs back the figures below. The fast gates were run on this repository as p
 | Upgrade | Compatible patches accepted by `dpm upgrade-check`; an API patch and a breaking change refused | `feda338` | [`scripts/check-upgrade.sh`](scripts/check-upgrade.sh) |
 | Mutation | 331 of 331 vault, share registry and conversion mutants killed, 4 recorded as equivalent with their arguments; 47 of 47 math mutants killed | full mutation runs on SDK 3.4.11 before `feda338`; `feda338` checked that every mutant still applies | [`scripts/mutate-registry.py`](scripts/mutate-registry.py), [`scripts/mutate-math.py`](scripts/mutate-math.py) |
 
-Since `feda338` the production packages have changed in one comment line. The later commits moved test and example directories to the library's layout, renamed the example, and added tests, documents and checks; none changed what a choice does.
+Since `feda338` the production packages have changed in one comment line. The later commits moved test and example directories to the canton-contracts layout at `aeca01d`, renamed the example, and added tests, documents and checks; none changed what a choice does.
 
 ## Compatibility
 
