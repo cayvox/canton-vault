@@ -13,9 +13,9 @@ A vault holds one underlying instrument and issues shares against it, with ERC-4
 
 | Package | Kind | Contents |
 |---|---|---|
-| [`cvx-vault-math-v1`](packages/utils/vault-math-v1/README.md) | Utility, no templates | `mulDiv` with floor and ceiling rounding over the full `Decimal` range, and the share conversion functions |
+| [`cvx-vault-math-v1`](packages/utils/vault-math-v1/README.md) | Utility, no templates | `mulDiv` with floor and ceiling rounding over the full `Decimal` range, in `Cayvox.VaultMathV1` |
 | [`cvx-api-vault-v1`](packages/token/api-vault-v1/README.md) | Frozen API | The `Vault` interface: a view for wallets and indexers, no choices |
-| [`cvx-vault-v1`](packages/token/vault-v1/README.md) | Implementation | `VaultState`, `DepositRequest`, `RedeemRequest`, and the share registry |
+| [`cvx-vault-v1`](packages/token/vault-v1/README.md) | Implementation | `VaultState`, `DepositRequest`, `RedeemRequest`, the share registry, and the six share conversion functions (`convertToShares`, `convertToAssets`, `previewDeposit`, `previewMint`, `previewWithdraw`, `previewRedeem`) in `Cayvox.VaultV1.Conversion` |
 | [`com-example-vault-admission-v1`](examples/vault-admission-v1/README.md) | Example, never released | A vault behind an on-ledger admission check |
 | [`cvx-vault-reconcile-tool`](tools/vault-reconcile/README.md) | Tool, never released | A read-only Daml Script that reconciles a vault's totals with custody and share events |
 
