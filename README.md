@@ -95,7 +95,7 @@ Two runs back the figures below. The fast gates were run on this repository as p
 |---|---|---|---|
 | Unit and scenario tests, in memory | 267 Daml Script runs per SDK on SDK 3.4.11, 3.5.8 and 3.5.10, 0 failures: 239 vault, 20 math and 2 API tests, and the example's 5 tests and its demo; the tool's 5 tests pass on each SDK too | this repository | [`scripts/check-coverage.sh`](scripts/check-coverage.sh), [`scripts/check-tools.sh`](scripts/check-tools.sh) |
 | Coverage | Every production template created and every choice exercised, the example's included; 13 of 13 interface choices of the vault package exercised | this repository | [`scripts/check-coverage.sh`](scripts/check-coverage.sh), [`scripts/check-interface-coverage.py`](scripts/check-interface-coverage.py) |
-| Rename | The renamed tree builds on all three SDKs and passes every unit and scenario test on SDK 3.5.8; the renamed API package's ID is `1877add94dae2d94` | this repository | [`scripts/rename-d17.py`](scripts/rename-d17.py) |
+| Rename | The renamed tree builds on all three SDKs and passes every unit and scenario test on SDK 3.5.8; the renamed API package's ID is `1877add94dae2d94` | this repository | [`scripts/rename-to-openzeppelin.py`](scripts/rename-to-openzeppelin.py) |
 | The same tests on Canton sandboxes | 259 tests per run, 0 failures, on protocol version 34 (SDK 3.4.11) and on protocol version 35 with the DARs of SDK 3.4.11 and of SDK 3.5.10 | `feda338` | [`scripts/check-sandbox.sh`](scripts/check-sandbox.sh) |
 | Operation sequences | 1,000 seeded sequences per SDK (3.4.11 and 3.5.10), 30,112 operations, invariants checked after each, 0 violations | `feda338` | [`scripts/check-sequences.sh`](scripts/check-sequences.sh) |
 | Differential math | 211 edge vectors and 20,000 seeded random vectors against an exact Python oracle, 0 mismatches, on SDK 3.4.11 and 3.5.10 | `feda338` | [`scripts/check-math-oracle.sh`](scripts/check-math-oracle.sh) |
@@ -118,10 +118,10 @@ The API package is always built by SDK 3.4.11, and the other packages consume th
 
 ## Renaming to the library's names
 
-The packages use the working names `cvx-*` and the modules `Cayvox.*`, so that the code does not present itself as OpenZeppelin's before the maintainers accept it. [`scripts/rename-d17.py`](scripts/rename-d17.py) copies the repository and renames packages to `openzeppelin-*`, modules to `OpenZeppelin.*` and error identifiers to `openzeppelin.com/<component>-<failure>`, and records the renamed API package's new ID. [`scripts/check-rename.sh`](scripts/check-rename.sh) builds the renamed copy and runs its tests on every SDK of the matrix. The example keeps its `com-example-*` name and `Example.*` modules, as the library's examples do.
+The packages use the working names `cvx-*` and the modules `Cayvox.*`, so that the code does not present itself as OpenZeppelin's before the maintainers accept it. [`scripts/rename-to-openzeppelin.py`](scripts/rename-to-openzeppelin.py) copies the repository and renames packages to `openzeppelin-*`, modules to `OpenZeppelin.*` and error identifiers to `openzeppelin.com/<component>-<failure>`, and records the renamed API package's new ID. [`scripts/check-rename.sh`](scripts/check-rename.sh) builds the renamed copy and runs its tests on every SDK of the matrix. The example keeps its `com-example-*` name and `Example.*` modules, as the library's examples do.
 
 ```sh
-scripts/rename-d17.py ../canton-vault-renamed
+scripts/rename-to-openzeppelin.py ../canton-vault-renamed
 ```
 
 ## License and acknowledgements

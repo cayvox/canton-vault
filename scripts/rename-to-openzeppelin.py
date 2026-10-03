@@ -34,7 +34,7 @@ Finally it fails if a working name is left in a renamed file.
 
 The repository is never modified, and the renamed tree is never committed.
 
-Usage: scripts/rename-d17.py DEST     (DEST must not exist and must lie outside the repository)
+Usage: scripts/rename-to-openzeppelin.py DEST     (DEST must not exist and must lie outside the repository)
 """
 
 import os
@@ -58,7 +58,7 @@ LEFT = re.compile(r"cayvox|\bcvx\b", re.IGNORECASE)
 
 
 # The rename's own rules name the working names; it is copied unchanged.
-UNCHANGED = {"scripts/rename-d17.py"}
+UNCHANGED = {"scripts/rename-to-openzeppelin.py"}
 
 
 def renamed(rel):

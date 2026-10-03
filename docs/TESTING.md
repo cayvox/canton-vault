@@ -51,7 +51,7 @@ A change is ready when every gate passes. Each gate states what it checks and th
 | Q-12 | Style: no em or en dashes; no absolute paths; no usernames | `scripts/check-style.sh` |
 | Q-13 | Independent review: every package is reviewed by two independent reviewers; each finding is fixed in its own commit and listed | Review log |
 | Q-14 | Upgrade: `dpm upgrade-check` passes between the release candidate and a compatible patch candidate, and fails as expected for a known breaking change | `scripts/check-upgrade.sh` |
-| Q-15 | Rename: the D-17 rename produces a tree that passes Q-01 to Q-05 | `scripts/check-rename.sh` (`scripts/rename-d17.py`) |
+| Q-15 | Rename: the D-17 rename produces a tree that passes Q-01 to Q-05 | `scripts/check-rename.sh` (`scripts/rename-to-openzeppelin.py`) |
 | Q-16 | Token DAR identity: every third-party DAR under `dars/vendor/` has an entry in `dars/manifest.yaml` whose SHA-256, main package ID, name, version and package-ID closure match the file; the file is byte-identical to its upstream path at the recorded Splice tag, and the tag resolves to the recorded commit; a Splice token standard API or utils DAR has the main package ID pinned in `dars/token-standard-pins.txt` (D-03); and every Splice DAR named in a data-dependency of a package of this repository is a manifest file | `scripts/check-token-dars.sh`, which reads its pinned IDs from `dars/` |
 
 ## 5. Continuous integration

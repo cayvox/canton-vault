@@ -96,7 +96,7 @@ One DAR tree exists at a time. Test reports go to `test-reports/<sdk>/` (`script
 | `scripts/check-sequences.sh`, `scripts/check-sequences.py` | Q-08, 1,000 seeded sequences per SDK | Written here |
 | `scripts/mutate-registry.py` | Q-07 for `cvx-vault-v1`, with the mutant precheck that `ci.sh` runs | Written here |
 | `scripts/check-upgrade.sh` | Q-14, `dpm upgrade-check` on a patch and a breaking candidate | Written here |
-| `scripts/rename-d17.py`, `scripts/check-rename.sh` | Q-15, the D-17 rename in a copy outside the repository | Written here |
+| `scripts/rename-to-openzeppelin.py`, `scripts/check-rename.sh` | Q-15, the D-17 rename in a copy outside the repository | Written here |
 | `scripts/check-examples.sh` | examples | Port of canton-contracts `scripts/check-examples.sh` |
 | `scripts/check-tools.sh` | the tooling tests | Written here |
 | `scripts/demo.sh` | the demo on a sandbox | Written here |

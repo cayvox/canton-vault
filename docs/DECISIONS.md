@@ -188,7 +188,7 @@ Upstream sources are cited at pinned revisions: OpenZeppelin/canton-contracts at
 
 ## D-17 · Working names, and a tested mechanical rename
 
-- **Decision:** Packages use `cvx-*` names and `Cayvox.*` modules. A script renames packages, modules, error domain and README references to the canton-contracts form (`openzeppelin-*`, `OpenZeppelin.*`), and CI proves the renamed tree builds and passes every test (`scripts/rename-d17.py`, `scripts/check-rename.sh`, gate Q-15).
+- **Decision:** Packages use `cvx-*` names and `Cayvox.*` modules. A script renames packages, modules, error domain and README references to the canton-contracts form (`openzeppelin-*`, `OpenZeppelin.*`), and CI proves the renamed tree builds and passes every test (`scripts/rename-to-openzeppelin.py`, `scripts/check-rename.sh`, gate Q-15).
 - **Evidence:** naming rules in canton-contracts [`AGENTS.md:31-34`](https://github.com/OpenZeppelin/canton-contracts/blob/aeca01d043311d8ccc8ab7cda4d7c16e682429fa/AGENTS.md#L31-L34) and [`:47-48`](https://github.com/OpenZeppelin/canton-contracts/blob/aeca01d043311d8ccc8ab7cda4d7c16e682429fa/AGENTS.md#L47-L48). The working names keep this proposal distinct from OpenZeppelin's packages until the maintainers adopt it.
 - **Reversal cost:** Low.
 - **Open question for maintainers:** no.

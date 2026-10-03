@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Gate Q-15: the D-17 rename produces a tree that passes Q-01 to Q-05
 # (docs/TESTING.md). Renames a copy of the repository into a temporary
-# directory outside it with scripts/rename-d17.py, then runs, inside the
+# directory outside it with scripts/rename-to-openzeppelin.py, then runs, inside the
 # renamed copy and with its renamed scripts, on each SDK: Q-02
 # (scripts/check.sh), Q-01 (every package built from clean, the API package
 # with SDK 3.4.11, and scripts/check-api-ids.sh against the renamed record),
@@ -22,7 +22,7 @@ SCRATCH="$(mktemp -d)"
 DEST="$SCRATCH/renamed"
 [ "${RENAME_KEEP:-0}" = 1 ] || trap 'rm -rf "$SCRATCH"' EXIT
 
-python3 "$ROOT/scripts/rename-d17.py" "$DEST"
+python3 "$ROOT/scripts/rename-to-openzeppelin.py" "$DEST"
 cd "$DEST"
 
 package_dirs() { sed -n 's/^[[:space:]]*-[[:space:]]*//p' multi-package.yaml; }

@@ -53,7 +53,7 @@ DAML_PACKAGE=test/vault-v1-test dpm test --all --show-coverage
 
 ## Conventions
 
-[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) restates the conventions of OpenZeppelin/canton-contracts that this repository follows, each linked to its source, and lists where this repository differs. Package names keep the working prefix `cvx` and modules the prefix `Cayvox`; `scripts/rename-d17.py` produces the library's names (D-17).
+[`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) restates the conventions of OpenZeppelin/canton-contracts that this repository follows, each linked to its source, and lists where this repository differs. Package names keep the working prefix `cvx` and modules the prefix `Cayvox`; `scripts/rename-to-openzeppelin.py` produces the library's names (D-17).
 
 ## Commits
 
