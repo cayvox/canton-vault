@@ -81,7 +81,7 @@ sequenceDiagram
 
 ## Verification
 
-Two runs back the figures below. The fast gates were run on this repository as published: Q-12, Q-16, Q-02 and Q-11, then the build and every unit and scenario test on each SDK of the matrix. The longer suites come from the final full run of [`scripts/ci.sh`](scripts/ci.sh) at commit `feda338` of the development history, which is not part of this repository's history. Every figure can be reproduced with the linked script.
+Two runs back the figures below. The fast gates were run on this repository as published: style, token DAR pins, repository conventions and documentation, then the build and every unit and scenario test on each SDK of the matrix. [`docs/TESTING.md`](docs/TESTING.md) defines each gate. The longer suites come from the final full run of [`scripts/ci.sh`](scripts/ci.sh) at commit `feda338` of the development history, which is not part of this repository's history. Every figure can be reproduced with the linked script.
 
 | Evidence | Result | Run | Reproduce |
 |---|---|---|---|
