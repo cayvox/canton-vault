@@ -23,10 +23,11 @@ Each package has a test package beside it under `test/`, `examples/` or `tools/`
 
 ## Quick start
 
-Install dpm and the SDKs as the [dpm documentation](https://docs.canton.network/sdks-tools/cli-tools/dpm) describes, with a JDK 17 or later:
+Install dpm and the SDKs as the [dpm documentation](https://docs.canton.network/sdks-tools/cli-tools/dpm) describes. The same page states that dpm needs a JDK 17 or later. The installer puts dpm in `~/.dpm/bin`, which must be on the `PATH`:
 
 ```sh
 curl https://get.digitalasset.com/install/install.sh | sh
+export PATH="$HOME/.dpm/bin:$PATH"
 dpm install 3.4.11
 dpm install 3.5.10
 ```
@@ -39,7 +40,7 @@ DAML_PACKAGE=test/vault-v1-test dpm test --all --show-coverage
 DAML_PACKAGE=examples/vault-admission-v1-test dpm test --all
 ```
 
-Run the example's whole flow on a local Canton sandbox (SDK 3.5.10, protocol version 35), printing each step; it needs `jq`, `unzip` and `lsof`, and free ports 6864 and 6866 to 6869:
+Run the example's whole flow on a local Canton sandbox (SDK 3.5.10, protocol version 35), printing each step; it needs `jq`, `unzip` and `lsof`, and free ports 6864, 6866 to 6869 and 16915:
 
 ```sh
 scripts/demo.sh
