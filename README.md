@@ -4,6 +4,8 @@ An ERC-4626-style share vault for Canton, written in Daml, over one Canton Token
 
 > [!IMPORTANT]
 > **Status.** A proposed contribution for OpenZeppelin canton-contracts [issue #28](https://github.com/OpenZeppelin/canton-contracts/issues/28). The code has not been audited. It is not for production use.
+>
+> [Open questions for the library maintainers](docs/DECISIONS.md#open-questions-for-library-maintainers)
 
 ## What it is
 
